@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -151,6 +152,7 @@ class PredictModelServer(ModelServer):
         self.hz = hz
 
         self._chunk_buffers: dict[str, ActionChunkBuffer] = {}
+        self._native_action_buffers: dict[str, deque[np.ndarray]] = {}
         self._session_chunk_sizes: dict[str, int] = {}
         # Serialise predict() calls so only one runs on the GPU at a time.
         # The batched path (_dispatch_loop) is already single-threaded; this
@@ -209,8 +211,8 @@ class PredictModelServer(ModelServer):
         """Return the effective chunk_size for a session."""
         return self._session_chunk_sizes.get(ctx.session_id, self.chunk_size)
 
-    def _try_serve_from_buffer(self, ctx: SessionContext) -> np.ndarray | None:
-        """Return a buffered action if available, else ``None``."""
+    def _try_serve_from_buffer(self, ctx: SessionContext) -> Action | None:
+        """Return a buffered action payload if available, else ``None``."""
         cs = self._get_chunk_size(ctx)
         if cs is None:
             return None
@@ -220,7 +222,14 @@ class PredictModelServer(ModelServer):
             self._chunk_buffers[sid] = ActionChunkBuffer(cs, ensemble_fn)
         buf = self._chunk_buffers[sid]
         if not buf.empty:
-            return buf.pop()
+            action = buf.pop()
+            if action is None:
+                return None
+            payload: Action = {"actions": action}
+            native_buf = self._native_action_buffers.get(sid)
+            if native_buf:
+                payload["model_native_action"] = native_buf.popleft()
+            return payload
         return None
 
     def _normalize_result(self, result: Action, ctx: SessionContext) -> Action:
@@ -249,12 +258,22 @@ class PredictModelServer(ModelServer):
             await ctx.send_action(result)
             return
 
+        native_actions = result.get("model_native_actions")
+        if native_actions is not None:
+            native_arr = np.asarray(native_actions, dtype=np.float32)
+            if native_arr.ndim == 2:
+                self._native_action_buffers[ctx.session_id] = deque(native_arr[: len(actions)])
+
         # Push chunk and pop first action
         buf = self._chunk_buffers[ctx.session_id]
         buf.push_chunk(actions)
         action = buf.pop()
         if action is not None:
-            await ctx.send_action({"actions": action})
+            payload: Action = {"actions": action}
+            native_buf = self._native_action_buffers.get(ctx.session_id)
+            if native_buf:
+                payload["model_native_action"] = native_buf.popleft()
+            await ctx.send_action(payload)
 
     # ------------------------------------------------------------------
     # on_observation: CI vs single vs batch dispatch
@@ -282,7 +301,7 @@ class PredictModelServer(ModelServer):
         # Serve from chunk buffer if available (skip inference)
         buffered = self._try_serve_from_buffer(ctx)
         if buffered is not None:
-            await ctx.send_action({"actions": buffered})
+            await ctx.send_action(buffered)
             return
 
         t0 = time.monotonic()
@@ -503,6 +522,7 @@ class PredictModelServer(ModelServer):
         """
         sid = ctx.session_id
         self._chunk_buffers.pop(sid, None)
+        self._native_action_buffers.pop(sid, None)
 
         if self.continuous_inference:
             await self._stop_ci(sid)

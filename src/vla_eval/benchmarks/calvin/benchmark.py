@@ -214,6 +214,7 @@ class CALVINBenchmark(StepBenchmark):
         self._subtask_step: int = 0
         self._completed: int = 0
         self._last_act: np.ndarray | None = None
+        self._last_env_action: np.ndarray | None = None
         self._start_info: dict | None = None
         self._subtask_just_reset: bool = False
         self._device = None
@@ -447,6 +448,7 @@ class CALVINBenchmark(StepBenchmark):
         self._subtask_step = 0
         self._completed = 0
         self._subtask_just_reset = False
+        self._last_env_action: np.ndarray | None = None
 
         # Reset env to initial condition
         robot_obs, scene_obs = _get_env_state_for_initial_condition(initial_condition)
@@ -475,6 +477,7 @@ class CALVINBenchmark(StepBenchmark):
             act = self._process_absolute_action(action)
         else:
             act = self._process_delta_action(action)
+        self._last_env_action = act.astype(np.float32, copy=True)
 
         # Step environment (expects shape [1, 1, 7] torch tensor)
         assert self._env is not None
@@ -621,6 +624,20 @@ class CALVINBenchmark(StepBenchmark):
 
     def get_metadata(self) -> dict[str, Any]:
         return {"max_steps": (self._ep_len or EP_LEN) * NUM_SUBTASKS}
+
+    def get_artifact_state(self) -> dict[str, Any]:
+        current_subtask = None
+        if self._eval_sequence and 0 <= self._subtask_idx < len(self._eval_sequence):
+            current_subtask = self._eval_sequence[self._subtask_idx]
+        state: dict[str, Any] = {
+            "subtask_idx": self._subtask_idx,
+            "subtask_step": self._subtask_step,
+            "completed_subtasks": self._completed,
+            "current_subtask": current_subtask,
+        }
+        if self._last_env_action is not None:
+            state["env_action"] = self._last_env_action
+        return state
 
     def get_action_spec(self) -> dict[str, DimSpec]:
         if self.absolute_action:

@@ -141,6 +141,15 @@ class Benchmark(ABC):
         """Render current env state as image. Optional override."""
         return None
 
+    def get_artifact_state(self) -> dict[str, Any]:
+        """Return step-level debug/progress data for artifact recording.
+
+        Benchmarks can override this to expose information that is not part of
+        the model observation, such as subtask progress or the exact action
+        applied after benchmark-specific conversion.
+        """
+        return {}
+
 
 # ---------------------------------------------------------------------------
 # Step-based convenience subclass
