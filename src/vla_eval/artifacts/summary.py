@@ -35,6 +35,31 @@ def _fmt_duration(seconds: float | None) -> str:
     return f"{h:02d}:{m:02d}:{s:05.2f}"
 
 
+def _execution_elapsed_sec(result: dict[str, Any], episodes: list[tuple[str, dict[str, Any]]]) -> float:
+    """Return elapsed time for the summary.
+
+    For a single-process run, episode elapsed times are sequential and summing
+    them is the right approximation. For merged shard results, shards ran in
+    parallel, so report the average shard elapsed instead of the sum across all
+    shards.
+    """
+    total_elapsed = sum(float(ep.get("elapsed_sec") or 0.0) for _, ep in episodes)
+
+    merge_info = result.get("merge_info")
+    if not isinstance(merge_info, dict):
+        return total_elapsed
+
+    shards_found = merge_info.get("shards_found")
+    if isinstance(shards_found, list) and shards_found:
+        return total_elapsed / len(shards_found)
+
+    num_shards = merge_info.get("num_shards")
+    if isinstance(num_shards, int) and num_shards > 0:
+        return total_elapsed / num_shards
+
+    return total_elapsed
+
+
 def _model_label(result: dict[str, Any]) -> str:
     info = result.get("server_info") or {}
     server = info.get("model_server", "unknown")
@@ -85,7 +110,7 @@ def write_experiment_summary(result: dict[str, Any], output_dir: Path, safe_name
     episodes = _episodes(result)
     total = len(episodes)
     successes = sum(1 for _, ep in episodes if _success(ep))
-    elapsed = sum(float(ep.get("elapsed_sec") or 0.0) for _, ep in episodes)
+    elapsed = _execution_elapsed_sec(result, episodes)
 
     created = result.get("created_at")
     try:

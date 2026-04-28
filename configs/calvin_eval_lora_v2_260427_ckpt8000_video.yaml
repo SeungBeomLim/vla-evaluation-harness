@@ -1,0 +1,16 @@
+# CALVIN ABC->D evaluation for X-VLA LoRA v2 ckpt-8000.
+extends: calvin_eval_lora_260424.yaml
+
+output_dir: "./results/xvla_calvin_lora_v2_260427_ckpt8000_eval"
+
+benchmarks:
+  - benchmark: "vla_eval.benchmarks.calvin.benchmark:CALVINBenchmark"
+    mode: sync
+    episodes_per_task: 1
+    save_rollout_video: true
+    save_rollout_trajectory: false
+    rollout_video_fps: 10
+    params:
+      dataset_path: "/data/calvin/dataset/validation"
+      num_sequences: 1000
+      seed: 0

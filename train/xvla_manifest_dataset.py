@@ -14,6 +14,7 @@ from torch.utils.data import Dataset
 
 
 GRIPPER_INDICES_20D = (9, 19)
+CACHED_ARRAY_KEYS = frozenset({"model_native_action", "state", "language_id", "subtask_idx"})
 
 
 def _matrix_to_rot6d_interleaved(mat: np.ndarray) -> np.ndarray:
@@ -226,6 +227,8 @@ class XVLAManifestDataset(Dataset):
 
     def _load_array(self, trajectory_path: Path, key: str) -> np.ndarray:
         cache_key = (trajectory_path, key)
+        if key not in CACHED_ARRAY_KEYS:
+            return self._load_npz(trajectory_path)[key]
         if cache_key not in self._array_cache:
             self._array_cache[cache_key] = self._load_npz(trajectory_path)[key]
         return self._array_cache[cache_key]

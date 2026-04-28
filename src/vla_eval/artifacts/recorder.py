@@ -94,6 +94,8 @@ class EpisodeArtifactRecorder:
         task: Task,
         server_info: dict[str, Any],
         fps: int = 10,
+        save_video: bool = True,
+        save_trajectory: bool = True,
     ) -> None:
         self.output_dir = output_dir
         self.benchmark_name = benchmark_name
@@ -102,6 +104,8 @@ class EpisodeArtifactRecorder:
         self.task = task
         self.server_info = server_info
         self.fps = fps
+        self.save_video = save_video
+        self.save_trajectory = save_trajectory
 
         rollout_name = f"{_safe_name(benchmark_name)}_{_safe_name(task_name)}_ep{episode_id}"
         self.rollout_dir = output_dir / "rollouts" / rollout_name
@@ -211,18 +215,24 @@ class EpisodeArtifactRecorder:
 
     def finalize(self, episode_result: dict[str, Any]) -> dict[str, Any]:
         """Write trajectory, metadata, and per-view videos. Returns relative paths."""
-        trajectory_path = self.rollout_dir / "trajectory.npz"
         arrays = self._trajectory_arrays()
-        np.savez_compressed(trajectory_path, **arrays)
+
+        files: dict[str, Any] = {}
+        if self.save_trajectory:
+            trajectory_path = self.rollout_dir / "trajectory.npz"
+            np.savez_compressed(trajectory_path, **arrays)
+            files["trajectory"] = str(trajectory_path.relative_to(self.output_dir))
 
         video_paths: dict[str, str] = {}
-        for view, frames in self.images.items():
-            video_path = self.rollout_dir / f"video_{_safe_name(view)}.mp4"
-            err = _write_video(video_path, _stack(frames, dtype=np.uint8), fps=self.fps)
-            if err is None:
-                video_paths[view] = str(video_path.relative_to(self.output_dir))
-            else:
-                self.video_errors[view] = err
+        if self.save_video:
+            for view, frames in self.images.items():
+                video_path = self.rollout_dir / f"video_{_safe_name(view)}.mp4"
+                err = _write_video(video_path, _stack(frames, dtype=np.uint8), fps=self.fps)
+                if err is None:
+                    video_paths[view] = str(video_path.relative_to(self.output_dir))
+                else:
+                    self.video_errors[view] = err
+            files["videos"] = video_paths
 
         action_spec = self.server_info.get("action_spec", {})
         metadata = {
@@ -253,10 +263,7 @@ class EpisodeArtifactRecorder:
                     "dims": int(arrays["env_action"].shape[-1]) if "env_action" in arrays else None,
                 },
             },
-            "files": {
-                "trajectory": str(trajectory_path.relative_to(self.output_dir)),
-                "videos": video_paths,
-            },
+            "files": files,
         }
         if self.video_errors:
             metadata["video_errors"] = self.video_errors
@@ -267,7 +274,6 @@ class EpisodeArtifactRecorder:
         return {
             "rollout_dir": str(self.rollout_dir.relative_to(self.output_dir)),
             "metadata": str(metadata_path.relative_to(self.output_dir)),
-            "trajectory": str(trajectory_path.relative_to(self.output_dir)),
-            "videos": video_paths,
+            **files,
             **({"video_errors": self.video_errors} if self.video_errors else {}),
         }

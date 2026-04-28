@@ -3,7 +3,8 @@
 .env
 .env.*
 /results
-/train
+/train/outputs/
+/train/runs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

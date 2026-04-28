@@ -148,6 +148,11 @@ class EvalConfig:
     paced: bool = True
     # Wait for first action before starting step loop (sanity check: should match sync)
     wait_first_action: bool = False
+    # Persist per-episode rollout videos for debugging.
+    save_rollout_video: bool = False
+    # Persist compressed per-step arrays alongside videos. This can be large.
+    save_rollout_trajectory: bool = False
+    rollout_video_fps: int = 10
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> EvalConfig:
@@ -171,6 +176,9 @@ class EvalConfig:
             throughput_mode=data.get("throughput_mode", False),
             paced=_parse_paced(data),
             wait_first_action=data.get("wait_first_action", False),
+            save_rollout_video=data.get("save_rollout_video", False),
+            save_rollout_trajectory=data.get("save_rollout_trajectory", False),
+            rollout_video_fps=data.get("rollout_video_fps", 10),
         )
 
     def resolved_name(self) -> str:

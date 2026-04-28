@@ -4,6 +4,7 @@
 #     "vla-eval",
 #     "torch>=2.2",
 #     "transformers>=4.44,<=4.51.3",
+#     "peft>=0.17",
 #     "numpy>=1.24",
 #     "pillow>=9.0",
 #     "opencv-python-headless",
@@ -307,6 +308,7 @@ class XVLAModelServer(PredictModelServer):
     def __init__(
         self,
         model_path: str = "2toINF/X-VLA-Libero",
+        lora_path: str | None = None,
         domain_id: int = 0,
         denoising_steps: int = 10,
         *,
@@ -328,6 +330,7 @@ class XVLAModelServer(PredictModelServer):
             use_predicted_proprio = True
 
         self.model_path = model_path
+        self.lora_path = lora_path
         self.domain_id = domain_id
         self.denoising_steps = denoising_steps
         self.benchmark_profile = benchmark_profile
@@ -365,6 +368,7 @@ class XVLAModelServer(PredictModelServer):
         self._current_xyz: dict[str, np.ndarray] = {}
 
         import torch
+        from peft import PeftModel
         from transformers import AutoConfig, AutoModel, AutoProcessor
 
         logger.info("Loading X-VLA from %s", self.model_path)
@@ -394,10 +398,18 @@ class XVLAModelServer(PredictModelServer):
             attn_implementation="eager",
             torch_dtype=torch.float32,
         )
+        if self.lora_path is not None:
+            logger.info("Applying X-VLA LoRA adapter from %s", self.lora_path)
+            self._model = PeftModel.from_pretrained(
+                self._model,
+                self.lora_path,
+                torch_dtype=torch.float32,
+            )
         self._model.to(device="cuda:0", dtype=torch.float32).eval()
         logger.info(
-            "X-VLA model loaded on cuda:0 (float32, profile=%s)",
+            "X-VLA model loaded on cuda:0 (float32, profile=%s, lora=%s)",
             self.benchmark_profile or "custom",
+            self.lora_path or "none",
         )
 
     async def on_episode_start(self, config: dict[str, Any], ctx: SessionContext) -> None:

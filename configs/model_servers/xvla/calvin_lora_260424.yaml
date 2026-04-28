@@ -1,0 +1,8 @@
+# X-VLA model server — CALVIN (ABC→D evaluation) with LoRA adapter
+extends: _base.yaml
+args:
+  model_path: "/home/seungbeomlim/research/vla-bench/third_party/models/x-vla/checkpoints/X-VLA-Calvin-ABC_D"
+  lora_path: "/home/seungbeomlim/research/vla-evaluation-harness/train/runs/xvla_calvin_lora_260424/ckpt-10000"
+  benchmark_profile: "calvin"
+  domain_id: 2
+  chunk_size: 20

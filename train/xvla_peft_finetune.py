@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.backends.cudnn as cudnn
 from accelerate import Accelerator
@@ -28,13 +31,48 @@ DEFAULT_XVLA_ROOT = REPO_ROOT.parent / "vla-bench" / "third_party" / "models" / 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(DEFAULT_XVLA_ROOT) not in sys.path:
-    sys.path.insert(0, str(DEFAULT_XVLA_ROOT))
+    sys.path.append(str(DEFAULT_XVLA_ROOT))
 
 from models.modeling_xvla import XVLA  # type: ignore  # noqa: E402
 from models.processing_xvla import XVLAProcessor  # type: ignore  # noqa: E402
 
 from train.xvla_loss import TorchActionStats, compute_normalized_xvla_loss
 from train.xvla_manifest_dataset import XVLAManifestCollator, XVLAManifestDataset
+
+
+def load_env_file(path: str | Path) -> bool:
+    """Load KEY=VALUE pairs from a .env file into the process environment."""
+    env_path = Path(path)
+    if not env_path.exists():
+        return False
+
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if value and len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+    return True
+
+
+def auto_load_dotenv() -> Path | None:
+    """Try common project-local .env locations without requiring extra deps."""
+    candidates = [Path.cwd() / ".env", REPO_ROOT / ".env"]
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if load_env_file(resolved):
+            return resolved
+    return None
 
 
 def get_logger(name: str = "xvla_peft", output_dir: str | Path | None = None, accelerator: Accelerator | None = None) -> logging.Logger:
@@ -258,8 +296,12 @@ def main(args: argparse.Namespace) -> None:
     accelerator.wait_for_everyone()
     logger = get_logger(output_dir=output_dir, accelerator=accelerator)
 
+    dotenv_path = auto_load_dotenv()
     set_seed(args.seed + accelerator.process_index)
     logger.info("Args: %s", args)
+    if dotenv_path is not None:
+        logger.info("Loaded environment variables from %s", dotenv_path)
+    logger.info("PYTORCH_CUDA_ALLOC_CONF=%s", os.environ.get("PYTORCH_CUDA_ALLOC_CONF"))
     if accelerator.is_main_process:
         (output_dir / "config.json").write_text(json.dumps(vars(args), indent=2))
 
