@@ -121,12 +121,24 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--margin", type=float, default=1.0)
     parser.add_argument("--lambda_pos", type=float, default=1.0)
     parser.add_argument("--lambda_ctr", type=float, default=1.0)
+    # TODO: Evaluate hinge (non-squared) contrastive loss plus lambda_ctr warmup
+    # after checking the effect of frequency/confidence triplet weighting.
+    parser.add_argument("--use_triplet_balance_weights", action="store_true", default=False)
+    parser.add_argument("--triplet_weight_min", type=float, default=0.5)
+    parser.add_argument("--triplet_weight_max", type=float, default=2.0)
+    parser.add_argument("--triplet_confidence_events", type=int, default=10)
     parser.add_argument("--stats_path", type=str, default=None, help="Optional cached action_stats.json path")
     parser.add_argument("--eval_split_ratio", type=float, default=0.1, help="Fraction of samples used for eval")
     parser.add_argument("--wandb_project", type=str, default="XVLA-LoRA-Training")
     parser.add_argument("--run_name", type=str, default="xvla-calvin-lora-new-260424")
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument(
+        "--lora_only",
+        action="store_true",
+        default=False,
+        help="Train only LoRA adapter weights; keep soft prompts/action encoder/action decoder frozen.",
+    )
     return parser
 
 
@@ -252,6 +264,7 @@ def evaluate(
         "loss_pos_rotation": 0.0,
         "loss_pos_gripper": 0.0,
         "triplet_fraction": 0.0,
+        "triplet_weight_mean": 0.0,
     }
     total_samples = 0.0
     with torch.no_grad():
@@ -263,6 +276,7 @@ def evaluate(
                 positive_action_first=batch["positive_action_first"],
                 negative_action_first=batch["negative_action_first"],
                 has_negative=batch["has_negative"],
+                sample_weight=batch.get("sample_weight"),
                 stats=stats_torch,
                 margin=args.margin,
                 lambda_pos=args.lambda_pos,
@@ -307,16 +321,18 @@ def main(args: argparse.Namespace) -> None:
 
     model = XVLA.from_pretrained(args.models)
     processor = XVLAProcessor.from_pretrained(args.models)
+    modules_to_save = None if args.lora_only else [
+        "transformer.soft_prompt_hub",
+        "transformer.action_encoder",
+        "transformer.action_decoder",
+    ]
+    logger.info("LoRA modules_to_save=%s", modules_to_save)
     lora_config = LoraConfig(
         lora_alpha=args.lora_alpha,
         r=args.lora_r,
         bias="none",
         target_modules="all-linear",
-        modules_to_save=[
-            "transformer.soft_prompt_hub",
-            "transformer.action_encoder",
-            "transformer.action_decoder",
-        ],
+        modules_to_save=modules_to_save,
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
@@ -331,7 +347,12 @@ def main(args: argparse.Namespace) -> None:
         num_actions=model.num_actions,
         domain_id=args.domain_id,
         repo_root=REPO_ROOT,
+        use_triplet_balance_weights=args.use_triplet_balance_weights,
+        triplet_weight_min=args.triplet_weight_min,
+        triplet_weight_max=args.triplet_weight_max,
+        triplet_confidence_events=args.triplet_confidence_events,
     )
+    logger.info("Triplet balance weights: %s", json.dumps(dataset.triplet_weight_summary, sort_keys=True))
     train_indices, eval_indices = split_indices(len(dataset), args.eval_split_ratio, args.seed)
     train_dataset = Subset(dataset, train_indices)
     eval_dataset = Subset(dataset, eval_indices)
@@ -384,6 +405,7 @@ def main(args: argparse.Namespace) -> None:
         "train_size": len(train_indices),
         "eval_size": len(eval_indices),
         "stats_path": str(stats_path),
+        "triplet_weight_summary": dataset.triplet_weight_summary,
     }
     logger.info(
         "Start training for %d iterations | train=%d eval=%d | world_size=%d",
@@ -412,6 +434,7 @@ def main(args: argparse.Namespace) -> None:
             positive_action_first=batch["positive_action_first"],
             negative_action_first=batch["negative_action_first"],
             has_negative=batch["has_negative"],
+            sample_weight=batch.get("sample_weight"),
             stats=stats_torch,
             margin=args.margin,
             lambda_pos=args.lambda_pos,
@@ -443,13 +466,14 @@ def main(args: argparse.Namespace) -> None:
                 dt = (time.time() - log_start) / max(1, args.log_interval)
                 log_start = time.time()
                 logger.info(
-                    "[%d/%d] train_loss=%.4f train_pos=%.4f train_ctr=%.4f triplet_frac=%.3f lr=%.2e (%.2fs/it)",
+                    "[%d/%d] train_loss=%.4f train_pos=%.4f train_ctr=%.4f triplet_frac=%.3f triplet_w=%.3f lr=%.2e (%.2fs/it)",
                     global_step,
                     args.iters,
                     logs["train/loss_total"],
                     logs["train/loss_pos"],
                     logs["train/loss_ctr"],
                     logs["train/triplet_fraction"],
+                    logs["train/triplet_weight_mean"],
                     logs["lr/transformer_core"],
                     dt,
                 )

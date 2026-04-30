@@ -39,6 +39,7 @@ def compute_normalized_xvla_loss(
     has_negative: torch.Tensor,
     stats: TorchActionStats,
     *,
+    sample_weight: torch.Tensor | None = None,
     margin: float = 1.0,
     lambda_pos: float = 1.0,
     lambda_ctr: float = 1.0,
@@ -62,6 +63,11 @@ def compute_normalized_xvla_loss(
     l_pos = pos_loss + rot_loss + grip_loss
 
     l_ctr = torch.zeros_like(l_pos)
+    ctr_weight = (
+        torch.ones_like(l_pos)
+        if sample_weight is None
+        else sample_weight.to(device=l_pos.device, dtype=l_pos.dtype)
+    )
     if has_negative.any():
         neg_pos_n, neg_rot_n = _normalize_components(negative_action_first, stats)
         pred_ctr = torch.cat(
@@ -77,7 +83,7 @@ def compute_normalized_xvla_loss(
         l_ctr = torch.where(has_negative, F.relu(violation).pow(2), torch.zeros_like(violation))
 
     loss_pos = l_pos.mean()
-    loss_ctr = l_ctr.mean()
+    loss_ctr = (l_ctr * ctr_weight).mean()
     loss_total = lambda_pos * loss_pos + lambda_ctr * loss_ctr
 
     return {
@@ -88,4 +94,7 @@ def compute_normalized_xvla_loss(
         "loss_pos_rotation": rot_loss.mean(),
         "loss_pos_gripper": grip_loss.mean(),
         "triplet_fraction": has_negative.float().mean(),
+        "triplet_weight_mean": ctr_weight[has_negative].mean()
+        if has_negative.any()
+        else ctr_weight.new_tensor(0.0),
     }

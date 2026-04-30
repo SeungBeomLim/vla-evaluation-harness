@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -106,16 +107,26 @@ class XVLAManifestDataset(Dataset):
         domain_id: int = 2,
         repo_root: str | Path | None = None,
         zero_right_arm: bool = True,
+        use_triplet_balance_weights: bool = False,
+        triplet_weight_min: float = 0.5,
+        triplet_weight_max: float = 2.0,
+        triplet_confidence_events: int = 10,
     ) -> None:
         self.manifest_paths = [Path(path) for path in manifest_paths]
         self.num_actions = int(num_actions)
         self.domain_id = int(domain_id)
         self.repo_root = Path(repo_root) if repo_root is not None else Path.cwd()
         self.zero_right_arm = zero_right_arm
+        self.use_triplet_balance_weights = use_triplet_balance_weights
+        self.triplet_weight_min = float(triplet_weight_min)
+        self.triplet_weight_max = float(triplet_weight_max)
+        self.triplet_confidence_events = int(triplet_confidence_events)
 
         self.entries: list[dict[str, Any]] = []
         for manifest_path in self.manifest_paths:
             self.entries.extend(_load_jsonl(manifest_path))
+
+        self.sample_weights, self.triplet_weight_summary = self._build_sample_weights()
 
         self._npz_cache: dict[Path, Any] = {}
         self._array_cache: dict[tuple[Path, str], np.ndarray] = {}
@@ -173,7 +184,65 @@ class XVLAManifestDataset(Dataset):
             "positive_action_first": torch.from_numpy(positive_first).float(),
             "negative_action_first": torch.from_numpy(negative_first).float(),
             "has_negative": torch.tensor(has_negative, dtype=torch.bool),
+            "sample_weight": torch.tensor(self.sample_weights[index], dtype=torch.float32),
         }
+
+    def _build_sample_weights(self) -> tuple[list[float], dict[str, Any]]:
+        weights = [1.0] * len(self.entries)
+        triplet_indices = [
+            idx
+            for idx, entry in enumerate(self.entries)
+            if entry.get("negative_rollout") is not None and entry.get("negative_step") is not None
+        ]
+        if not triplet_indices:
+            return weights, {"enabled": self.use_triplet_balance_weights, "num_triplet_samples": 0}
+
+        sample_counts: Counter[str] = Counter()
+        event_keys: dict[str, set[tuple[Any, ...]]] = defaultdict(set)
+        for idx in triplet_indices:
+            entry = self.entries[idx]
+            subtask = str(entry["subtask"])
+            sample_counts[subtask] += 1
+            event_keys[subtask].add(
+                (
+                    entry.get("match_rollout_failure", entry.get("negative_rollout")),
+                    entry.get("match_rollout_success", entry.get("positive_rollout")),
+                    entry.get("divergence_index"),
+                    entry.get("divergence_reason", "distance"),
+                )
+            )
+
+        mean_count = len(triplet_indices) / max(1, len(sample_counts))
+        raw_by_subtask: dict[str, float] = {}
+        event_counts = {subtask: len(keys) for subtask, keys in event_keys.items()}
+        for subtask, count in sample_counts.items():
+            w_freq = math.sqrt(mean_count / max(1, count))
+            w_freq = min(self.triplet_weight_max, max(self.triplet_weight_min, w_freq))
+            w_conf = min(1.0, math.sqrt(event_counts[subtask] / max(1, self.triplet_confidence_events)))
+            raw_by_subtask[subtask] = w_freq * w_conf
+
+        if self.use_triplet_balance_weights:
+            for idx in triplet_indices:
+                weights[idx] = raw_by_subtask[str(self.entries[idx]["subtask"])]
+
+        summary = {
+            "enabled": self.use_triplet_balance_weights,
+            "num_triplet_samples": len(triplet_indices),
+            "num_triplet_subtasks": len(sample_counts),
+            "mean_triplet_samples_per_subtask": mean_count,
+            "triplet_weight_min": self.triplet_weight_min,
+            "triplet_weight_max": self.triplet_weight_max,
+            "triplet_confidence_events": self.triplet_confidence_events,
+            "per_subtask": {
+                subtask: {
+                    "num_samples": sample_counts[subtask],
+                    "num_events": event_counts[subtask],
+                    "weight": raw_by_subtask[subtask],
+                }
+                for subtask in sorted(sample_counts)
+            },
+        }
+        return weights, summary
 
     def compute_action_stats(self, indices: list[int] | None = None) -> ActionStats:
         """Compute normalization stats from positive first-step actions."""
@@ -284,6 +353,7 @@ class XVLAManifestCollator:
             "positive_action_first": torch.stack([sample["positive_action_first"] for sample in batch], dim=0),
             "negative_action_first": torch.stack([sample["negative_action_first"] for sample in batch], dim=0),
             "has_negative": torch.stack([sample["has_negative"] for sample in batch], dim=0),
+            "sample_weight": torch.stack([sample["sample_weight"] for sample in batch], dim=0),
             "sample_type": [sample["sample_type"] for sample in batch],
             "subtask": [sample["subtask"] for sample in batch],
         }
