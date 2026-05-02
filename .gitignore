@@ -6,6 +6,8 @@
 /train/outputs/
 /train/runs/
 .codex
+batch.sh
+model_checkpoints/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
