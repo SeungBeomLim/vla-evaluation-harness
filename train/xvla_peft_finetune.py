@@ -36,7 +36,12 @@ if str(DEFAULT_XVLA_ROOT) not in sys.path:
 from models.modeling_xvla import XVLA  # type: ignore  # noqa: E402
 from models.processing_xvla import XVLAProcessor  # type: ignore  # noqa: E402
 
-from train.xvla_loss import TorchActionStats, compute_normalized_xvla_loss
+from train.xvla_loss import (
+    TorchActionStats,
+    compute_distance_probabilistic_nce_xvla_loss,
+    compute_normalized_squared_hinge_triplet_xvla_loss,
+    compute_preference_kl_loss,
+)
 from train.xvla_manifest_dataset import XVLAManifestCollator, XVLAManifestDataset
 
 
@@ -121,6 +126,26 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--margin", type=float, default=1.0)
     parser.add_argument("--lambda_pos", type=float, default=1.0)
     parser.add_argument("--lambda_ctr", type=float, default=1.0)
+    parser.add_argument(
+        "--loss_type",
+        choices=(
+            "triplet_squared_hinge",
+            "distance_probabilistic_nce",
+            "triplet_hinge",
+            "probabilistic_nce",
+        ),
+        default="triplet_squared_hinge",
+        help=(
+            "Contrastive loss objective. triplet_squared_hinge keeps the existing "
+            "squared-hinge triplet loss; distance_probabilistic_nce uses action-distance NCE. "
+            "triplet_hinge/probabilistic_nce are legacy aliases."
+        ),
+    )
+    parser.add_argument("--lambda_nce", type=float, default=1.0, help="Weight for probabilistic NCE loss.")
+    parser.add_argument("--nce_tau", type=float, default=1.0, help="Temperature tau for probabilistic NCE/KL logits.")
+    parser.add_argument("--lambda_gripper_nce", type=float, default=1.0, help="Gripper distance weight in NCE/KL distances.")
+    parser.add_argument("--use_preference_kl", action="store_true", default=False, help="Add frozen base-model preference KL.")
+    parser.add_argument("--lambda_kl", type=float, default=0.0, help="Weight for optional teacher preference KL.")
     # TODO: Evaluate hinge (non-squared) contrastive loss plus lambda_ctr warmup
     # after checking the effect of frequency/confidence triplet weighting.
     parser.add_argument("--use_triplet_balance_weights", action="store_true", default=False)
@@ -207,25 +232,97 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
     return outputs
 
 
-def predict_action_sequence(model: XVLA, batch: dict[str, Any]) -> torch.Tensor:
-    """Mirror XVLA.forward but return predicted action sequence for custom loss."""
-    enc = model.forward_vlm(batch["input_ids"], batch["image_input"], batch["image_mask"])
+def make_action_noise_context(model: XVLA, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Create the diffusion timestep/noisy action shared by student and teacher."""
     positive_action_seq = batch["positive_action_seq"]
-    proprio = batch["proprio"]
-
     batch_size = batch["input_ids"].shape[0]
     device = batch["input_ids"].device
     t = (torch.rand(1, device=device) + torch.arange(batch_size, device=device) / batch_size) % (1 - 1e-5)
     action_noisy = torch.randn_like(positive_action_seq) * t.view(-1, 1, 1) + positive_action_seq * (1 - t).view(-1, 1, 1)
-    proprio_m, action_noisy_m = model.action_space.preprocess(proprio, action_noisy)
+    proprio_m, action_noisy_m = model.action_space.preprocess(batch["proprio"], action_noisy)
+    return {
+        "t": t,
+        "proprio_m": proprio_m,
+        "action_noisy_m": action_noisy_m,
+    }
+
+
+def predict_action_sequence(model: XVLA, batch: dict[str, Any], noise_context: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
+    """Mirror XVLA.forward but return predicted action sequence for custom loss."""
+    enc = model.forward_vlm(batch["input_ids"], batch["image_input"], batch["image_mask"])
+    if noise_context is None:
+        noise_context = make_action_noise_context(model, batch)
     pred_action = model.transformer(
         domain_id=batch["domain_id"],
-        action_with_noise=action_noisy_m,
-        t=t,
-        proprio=proprio_m,
+        action_with_noise=noise_context["action_noisy_m"],
+        t=noise_context["t"],
+        proprio=noise_context["proprio_m"],
         **enc,
     )
     return pred_action
+
+
+def compute_loss_for_batch(
+    model: XVLA,
+    batch: dict[str, Any],
+    stats_torch: TorchActionStats,
+    args: argparse.Namespace,
+    *,
+    teacher_model: XVLA | None = None,
+) -> dict[str, torch.Tensor]:
+    noise_context = make_action_noise_context(model, batch)
+    pred_action_seq = predict_action_sequence(model, batch, noise_context=noise_context)
+    if args.loss_type in {"triplet_squared_hinge", "triplet_hinge"}:
+        loss_dict = compute_normalized_squared_hinge_triplet_xvla_loss(
+            pred_action_seq=pred_action_seq,
+            positive_action_first=batch["positive_action_first"],
+            negative_action_first=batch["negative_action_first"],
+            has_negative=batch["has_negative"],
+            sample_weight=batch.get("sample_weight"),
+            stats=stats_torch,
+            margin=args.margin,
+            lambda_pos=args.lambda_pos,
+            lambda_ctr=args.lambda_ctr,
+        )
+    elif args.loss_type in {"distance_probabilistic_nce", "probabilistic_nce"}:
+        loss_dict = compute_distance_probabilistic_nce_xvla_loss(
+            pred_action_seq=pred_action_seq,
+            positive_action_first=batch["positive_action_first"],
+            negative_action_first=batch["negative_action_first"],
+            has_negative=batch["has_negative"],
+            sample_weight=batch.get("sample_weight"),
+            stats=stats_torch,
+            tau=args.nce_tau,
+            lambda_pos=args.lambda_pos,
+            lambda_nce=args.lambda_nce,
+            lambda_gripper_nce=args.lambda_gripper_nce,
+        )
+    else:
+        raise ValueError(f"Unknown loss_type: {args.loss_type}")
+
+    if args.use_preference_kl:
+        if args.loss_type not in {"distance_probabilistic_nce", "probabilistic_nce"}:
+            raise ValueError("--use_preference_kl requires --loss_type distance_probabilistic_nce")
+        if teacher_model is None:
+            raise ValueError("teacher_model is required when --use_preference_kl is enabled")
+        with torch.no_grad():
+            teacher_pred_action_seq = predict_action_sequence(teacher_model, batch, noise_context=noise_context)
+        kl_dict = compute_preference_kl_loss(
+            student_pred_action_seq=pred_action_seq,
+            teacher_pred_action_seq=teacher_pred_action_seq,
+            positive_action_first=batch["positive_action_first"],
+            negative_action_first=batch["negative_action_first"],
+            has_negative=batch["has_negative"],
+            sample_weight=batch.get("sample_weight"),
+            stats=stats_torch,
+            tau=args.nce_tau,
+            lambda_gripper_kl=args.lambda_gripper_nce,
+        )
+        loss_dict = dict(loss_dict)
+        loss_dict.update(kl_dict)
+        loss_dict["loss_total"] = loss_dict["loss_total"] + args.lambda_kl * kl_dict["loss_kl"]
+
+    return loss_dict
 
 
 def save_checkpoint(accelerator: Accelerator, model: XVLA, output_dir: Path, global_step: int, stats_path: Path) -> None:
@@ -254,44 +351,33 @@ def evaluate(
     accelerator: Accelerator,
     stats_torch: TorchActionStats,
     args: argparse.Namespace,
+    teacher_model: XVLA | None = None,
 ) -> dict[str, float]:
     model.eval()
-    totals = {
-        "loss_total": 0.0,
-        "loss_pos": 0.0,
-        "loss_ctr": 0.0,
-        "loss_pos_position": 0.0,
-        "loss_pos_rotation": 0.0,
-        "loss_pos_gripper": 0.0,
-        "triplet_fraction": 0.0,
-        "triplet_weight_mean": 0.0,
-    }
+    if teacher_model is not None:
+        teacher_model.eval()
+    totals: dict[str, float] = {}
+    metric_keys: list[str] | None = None
     total_samples = 0.0
     with torch.no_grad():
         for batch in eval_loader:
             batch = move_batch_to_device(batch, accelerator.device)
-            pred_action_seq = predict_action_sequence(model, batch)
-            loss_dict = compute_normalized_xvla_loss(
-                pred_action_seq=pred_action_seq,
-                positive_action_first=batch["positive_action_first"],
-                negative_action_first=batch["negative_action_first"],
-                has_negative=batch["has_negative"],
-                sample_weight=batch.get("sample_weight"),
-                stats=stats_torch,
-                margin=args.margin,
-                lambda_pos=args.lambda_pos,
-                lambda_ctr=args.lambda_ctr,
-            )
+            loss_dict = compute_loss_for_batch(model, batch, stats_torch, args, teacher_model=teacher_model)
             batch_size = float(batch["positive_action_first"].shape[0])
+            if metric_keys is None:
+                metric_keys = list(loss_dict.keys())
+                totals = {key: 0.0 for key in metric_keys}
             stats_tensor = torch.tensor(
-                [loss_dict[key].detach().float().item() * batch_size for key in totals] + [batch_size],
+                [loss_dict[key].detach().float().item() * batch_size for key in metric_keys] + [batch_size],
                 device=accelerator.device,
             )
             stats_tensor = accelerator.reduce(stats_tensor, reduction="sum")
-            for idx, key in enumerate(totals):
+            for idx, key in enumerate(metric_keys):
                 totals[key] += float(stats_tensor[idx].item())
             total_samples += float(stats_tensor[-1].item())
     model.train()
+    if teacher_model is not None:
+        teacher_model.eval()
     denom = max(total_samples, 1.0)
     return {key: value / denom for key, value in totals.items()}
 
@@ -336,6 +422,13 @@ def main(args: argparse.Namespace) -> None:
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+    teacher_model: XVLA | None = None
+    if args.use_preference_kl:
+        logger.info("Loading frozen teacher model for preference KL from %s", args.models)
+        teacher_model = XVLA.from_pretrained(args.models)
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad_(False)
 
     manifest_dir = Path(args.manifest_dir)
     manifest_paths = [
@@ -393,6 +486,8 @@ def main(args: argparse.Namespace) -> None:
         lr_coef_soft=args.learning_coef,
     )
     model, optimizer, train_loader, eval_loader = accelerator.prepare(model, optimizer, train_loader, eval_loader)
+    if teacher_model is not None:
+        teacher_model.to(accelerator.device)
     stats_torch = TorchActionStats.from_python(action_stats, accelerator.device)
 
     model.train()
@@ -428,18 +523,7 @@ def main(args: argparse.Namespace) -> None:
         batch = move_batch_to_device(batch, accelerator.device)
         update_group_lrs(optimizer, global_step, args)
 
-        pred_action_seq = predict_action_sequence(model, batch)
-        loss_dict = compute_normalized_xvla_loss(
-            pred_action_seq=pred_action_seq,
-            positive_action_first=batch["positive_action_first"],
-            negative_action_first=batch["negative_action_first"],
-            has_negative=batch["has_negative"],
-            sample_weight=batch.get("sample_weight"),
-            stats=stats_torch,
-            margin=args.margin,
-            lambda_pos=args.lambda_pos,
-            lambda_ctr=args.lambda_ctr,
-        )
+        loss_dict = compute_loss_for_batch(model, batch, stats_torch, args, teacher_model=teacher_model)
         loss = loss_dict["loss_total"]
 
         accelerator.backward(loss)
@@ -483,7 +567,7 @@ def main(args: argparse.Namespace) -> None:
                 )
 
         if global_step % args.eval_interval == 0:
-            eval_metrics = evaluate(model, eval_loader, accelerator, stats_torch, args)
+            eval_metrics = evaluate(model, eval_loader, accelerator, stats_torch, args, teacher_model=teacher_model)
             accelerator.log({f"eval/{key}": value for key, value in eval_metrics.items()}, step=global_step)
             summary["last_eval_step"] = global_step
             for key, value in eval_metrics.items():

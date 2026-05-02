@@ -32,7 +32,52 @@ def _normalize_components(action_10d: torch.Tensor, stats: TorchActionStats) -> 
     return pos, rot
 
 
-def compute_normalized_xvla_loss(
+def _preference_squared_distances(
+    pred_action_first: torch.Tensor,
+    positive_action_first: torch.Tensor,
+    negative_action_first: torch.Tensor,
+    stats: TorchActionStats,
+    *,
+    lambda_gripper: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pred_pos_n, pred_rot_n = _normalize_components(pred_action_first, stats)
+    pos_pos_n, pos_rot_n = _normalize_components(positive_action_first, stats)
+    neg_pos_n, neg_rot_n = _normalize_components(negative_action_first, stats)
+
+    pred_grip_prob = torch.sigmoid(pred_action_first[..., 9])
+    positive_grip = positive_action_first[..., 9]
+    negative_grip = negative_action_first[..., 9]
+
+    d_pos = (
+        (pred_pos_n - pos_pos_n).pow(2).sum(dim=-1)
+        + (pred_rot_n - pos_rot_n).pow(2).sum(dim=-1)
+        + float(lambda_gripper) * (pred_grip_prob - positive_grip).pow(2)
+    )
+    d_neg = (
+        (pred_pos_n - neg_pos_n).pow(2).sum(dim=-1)
+        + (pred_rot_n - neg_rot_n).pow(2).sum(dim=-1)
+        + float(lambda_gripper) * (pred_grip_prob - negative_grip).pow(2)
+    )
+    return d_pos, d_neg
+
+
+def _masked_weighted_mean(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    sample_weight: torch.Tensor | None,
+    *,
+    average_over_batch: bool = True,
+) -> torch.Tensor:
+    masked = torch.where(mask, values, torch.zeros_like(values))
+    if sample_weight is not None:
+        masked = masked * sample_weight.to(device=values.device, dtype=values.dtype)
+    if average_over_batch:
+        return masked.mean()
+    denom = mask.float().sum().clamp_min(1.0).to(dtype=values.dtype)
+    return masked.sum() / denom
+
+
+def compute_normalized_squared_hinge_triplet_xvla_loss(
     pred_action_seq: torch.Tensor,
     positive_action_first: torch.Tensor,
     negative_action_first: torch.Tensor,
@@ -44,7 +89,7 @@ def compute_normalized_xvla_loss(
     lambda_pos: float = 1.0,
     lambda_ctr: float = 1.0,
 ) -> dict[str, torch.Tensor]:
-    """Compute normalized positive + squared-hinge contrastive loss."""
+    """Compute normalized BC + squared-hinge triplet contrastive loss."""
     pred = pred_action_seq[:, 0, :10]
 
     pred_pos_n, pred_rot_n = _normalize_components(pred, stats)
@@ -97,4 +142,145 @@ def compute_normalized_xvla_loss(
         "triplet_weight_mean": ctr_weight[has_negative].mean()
         if has_negative.any()
         else ctr_weight.new_tensor(0.0),
+    }
+
+
+def compute_distance_probabilistic_nce_xvla_loss(
+    pred_action_seq: torch.Tensor,
+    positive_action_first: torch.Tensor,
+    negative_action_first: torch.Tensor,
+    has_negative: torch.Tensor,
+    stats: TorchActionStats,
+    *,
+    sample_weight: torch.Tensor | None = None,
+    tau: float = 1.0,
+    lambda_pos: float = 1.0,
+    lambda_nce: float = 1.0,
+    lambda_gripper_nce: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    """Compute BC + distance-based probabilistic two-way NCE preference loss.
+
+    The NCE term treats the model action as the mean of a fixed-variance
+    Gaussian and optimizes ``-log P(a+ > a- | o)``:
+
+        softplus((d_pos - d_neg) / tau)
+
+    where ``d_pos`` and ``d_neg`` are normalized squared distances from the
+    prediction to positive/negative actions.  Gripper distance is measured in
+    probability space, while BC keeps BCEWithLogits for the binary target.
+    """
+    pred = pred_action_seq[:, 0, :10]
+
+    pred_pos_n, pred_rot_n = _normalize_components(pred, stats)
+    pos_pos_n, pos_rot_n = _normalize_components(positive_action_first, stats)
+
+    pred_grip_logit = pred[..., 9]
+    positive_grip = positive_action_first[..., 9]
+
+    pos_loss = F.mse_loss(pred_pos_n, pos_pos_n, reduction="none").mean(dim=-1)
+    rot_loss = F.mse_loss(pred_rot_n, pos_rot_n, reduction="none").mean(dim=-1)
+    grip_loss = F.binary_cross_entropy_with_logits(
+        pred_grip_logit,
+        positive_grip,
+        reduction="none",
+    )
+    l_bc = pos_loss + rot_loss + grip_loss
+
+    tau_tensor = pred.new_tensor(max(float(tau), 1e-8))
+    d_pos, d_neg = _preference_squared_distances(
+        pred,
+        positive_action_first,
+        negative_action_first,
+        stats,
+        lambda_gripper=lambda_gripper_nce,
+    )
+    nce_logits = (d_neg - d_pos) / tau_tensor
+    l_nce_all = F.softplus(-nce_logits)
+    loss_nce = _masked_weighted_mean(l_nce_all, has_negative, sample_weight)
+
+    loss_bc = l_bc.mean()
+    loss_total = lambda_pos * loss_bc + lambda_nce * loss_nce
+
+    active = has_negative
+    active_count = active.float().sum().clamp_min(1.0).to(dtype=pred.dtype)
+    d_pos_mean = torch.where(active, d_pos, torch.zeros_like(d_pos)).sum() / active_count
+    d_neg_mean = torch.where(active, d_neg, torch.zeros_like(d_neg)).sum() / active_count
+    logit_mean = torch.where(active, nce_logits, torch.zeros_like(nce_logits)).sum() / active_count
+    prob_mean = torch.where(active, torch.sigmoid(nce_logits), torch.zeros_like(nce_logits)).sum() / active_count
+    ctr_weight = (
+        torch.ones_like(l_bc)
+        if sample_weight is None
+        else sample_weight.to(device=l_bc.device, dtype=l_bc.dtype)
+    )
+
+    return {
+        "loss_total": loss_total,
+        "loss_pos": loss_bc,
+        "loss_ctr": loss_nce,
+        "loss_bc": loss_bc,
+        "loss_nce": loss_nce,
+        "loss_pos_position": pos_loss.mean(),
+        "loss_pos_rotation": rot_loss.mean(),
+        "loss_pos_gripper": grip_loss.mean(),
+        "nce_d_pos": d_pos_mean,
+        "nce_d_neg": d_neg_mean,
+        "nce_logit": logit_mean,
+        "nce_prob_pos": prob_mean,
+        "triplet_fraction": has_negative.float().mean(),
+        "triplet_weight_mean": ctr_weight[has_negative].mean()
+        if has_negative.any()
+        else ctr_weight.new_tensor(0.0),
+    }
+
+
+def compute_preference_kl_loss(
+    student_pred_action_seq: torch.Tensor,
+    teacher_pred_action_seq: torch.Tensor,
+    positive_action_first: torch.Tensor,
+    negative_action_first: torch.Tensor,
+    has_negative: torch.Tensor,
+    stats: TorchActionStats,
+    *,
+    sample_weight: torch.Tensor | None = None,
+    tau: float = 1.0,
+    lambda_gripper_kl: float = 1.0,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Compute Bernoulli KL between teacher and student pair preferences."""
+    student_pred = student_pred_action_seq[:, 0, :10]
+    teacher_pred = teacher_pred_action_seq[:, 0, :10].detach()
+    tau_tensor = student_pred.new_tensor(max(float(tau), 1e-8))
+
+    d_pos, d_neg = _preference_squared_distances(
+        student_pred,
+        positive_action_first,
+        negative_action_first,
+        stats,
+        lambda_gripper=lambda_gripper_kl,
+    )
+    with torch.no_grad():
+        d_pos_ref, d_neg_ref = _preference_squared_distances(
+            teacher_pred,
+            positive_action_first,
+            negative_action_first,
+            stats,
+            lambda_gripper=lambda_gripper_kl,
+        )
+        q_pos = torch.sigmoid((d_neg_ref - d_pos_ref) / tau_tensor)
+
+    p_pos = torch.sigmoid((d_neg - d_pos) / tau_tensor)
+    p = p_pos.clamp(eps, 1.0 - eps)
+    q = q_pos.clamp(eps, 1.0 - eps)
+    kl_all = q * torch.log(q / p) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - p))
+    loss_kl = _masked_weighted_mean(kl_all, has_negative, sample_weight)
+
+    active = has_negative
+    active_count = active.float().sum().clamp_min(1.0).to(dtype=student_pred.dtype)
+    p_mean = torch.where(active, p_pos, torch.zeros_like(p_pos)).sum() / active_count
+    q_mean = torch.where(active, q_pos, torch.zeros_like(q_pos)).sum() / active_count
+
+    return {
+        "loss_kl": loss_kl,
+        "kl_student_prob_pos": p_mean,
+        "kl_teacher_prob_pos": q_mean,
     }
