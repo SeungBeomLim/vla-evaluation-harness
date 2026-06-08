@@ -1,13 +1,7 @@
 # GR00T / LIBERO Training Data
 
-This directory contains the data construction utilities for the LIBERO
-same-initial-state success/failure experiments.
-
-Legacy CALVIN/X-VLA scripts live under:
-
-```text
-train/legacy_xvla_calvin/
-```
+This directory contains the current GR00T/LIBERO data construction, IDM,
+and preference fine-tuning utilities.
 
 ## Current Data Layout
 
@@ -108,29 +102,6 @@ runtime.*
 wandb.*
 ```
 
-## Cache IDM Actions
-
-Use the trained goal-image IDM checkpoint to cache a 3-step recovery prefix for
-each preference pair:
-
-```bash
-python3 train/idm/cache_actions.py \
-  --config experiment_specs/idm/libero_groot_goal_image_cache.yaml
-```
-
-For `chunk_preference_pair` rows, the IDM input is:
-
-```text
-negative image observation at target_step -> positive image observation at target_step
-```
-
-The cached actions are stored in:
-
-```text
-idm_actions.npz
-  idm_action: [num_pairs, 3, 7]
-```
-
 ## Evaluate IDM
 
 After training, run offline action prediction metrics and optional LIBERO
@@ -150,6 +121,15 @@ next state/image to the recorded `t+1` target.
 Before training, create contact sheets to verify that `policy_obs_step` is a
 reasonable chunk-start input and `target_step` captures a meaningful
 success/failure difference.
+
+For a numeric manifest summary, run:
+
+```bash
+python3 train/analyze_libero_preference_pairs.py \
+  --preference-pairs train/outputs/groot_libero_chunk_preference_pairs_260508/preference_pairs.jsonl \
+  --output train/outputs/groot_libero_chunk_preference_pairs_260508/analysis_summary.json \
+  --compute-action-gaps
+```
 
 ```bash
 python3 train/inspect_libero_preference_pairs.py \
@@ -172,24 +152,23 @@ offset13
 high-score
 ```
 
-## Older Rank Triplets
+## Train GR00T Preference LoRA
 
-The older rank-based triplet builder is kept for reference:
+Use YAML specs for fine-tuning runs:
 
-```text
-train/build_libero_triplet_dataset.py
-train/libero_triplet_dataset_builder.py
+```bash
+python3 train/groot_preference_finetune.py \
+  --config experiment_specs/preference/groot_libero_bc_only.yaml
+
+python3 train/groot_preference_finetune.py \
+  --config experiment_specs/preference/groot_libero_onset_only.yaml
 ```
 
-Those files produce:
+Run BC-only first. If BC-only damages benchmark performance, debug the
+fine-tuning pipeline before adding onset NCE or IDM NCE.
 
-```text
-triplets.jsonl
-success_only.jsonl
-summary.json
-```
+## Removed Legacy Code
 
-The old triplet format uses one selected step for anchor/positive/negative and
-does not separate `policy_obs_step` from `target_step`. Do not use it for the
-current GR00T preference/IDM training experiments unless intentionally running
-a legacy ablation.
+Older CALVIN/X-VLA LoRA scripts, state-only IDM scripts, and rank-triplet
+builders were removed from the active tree. The current path is the
+GR00T/LIBERO chunk preference manifest plus goal-image IDM.

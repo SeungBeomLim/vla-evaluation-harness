@@ -236,17 +236,19 @@ class PreferencePairDataset(Dataset):
         self,
         path: Path,
         *,
-        idm_actions_path: Path,
+        idm_actions_path: Path | None = None,
         action_key: str = "env_action",
         cache_size: int = 32,
     ) -> None:
         self.rows = _read_jsonl(path)
-        with np.load(idm_actions_path, allow_pickle=False) as idm_npz:
-            idm_key = "idm_action" if "idm_action" in idm_npz.files else "actions"
-            self.idm_actions = np.asarray(idm_npz[idm_key], dtype=np.float32)
+        self.idm_actions: np.ndarray | None = None
+        if idm_actions_path is not None:
+            with np.load(idm_actions_path, allow_pickle=False) as idm_npz:
+                idm_key = "idm_action" if "idm_action" in idm_npz.files else "actions"
+                self.idm_actions = np.asarray(idm_npz[idm_key], dtype=np.float32)
         self.action_key = action_key
         self.cache = _NpzLRU(cache_size)
-        if len(self.idm_actions) < len(self.rows):
+        if self.idm_actions is not None and len(self.idm_actions) < len(self.rows):
             raise ValueError(
                 f"IDM action count ({len(self.idm_actions)}) is smaller than rows ({len(self.rows)})"
             )
@@ -257,7 +259,7 @@ class PreferencePairDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
         loaded = _load_ref(row["vla_input"], self.cache)
-        horizon = int(row.get("target_window_size", row["idm"].get("horizon", 3)))
+        horizon = int(row.get("target_window_size", (row.get("idm") or {}).get("horizon", 3)))
         action_key = row.get("action_key", self.action_key)
 
         pos_ref = row["positive"]
@@ -267,16 +269,8 @@ class PreferencePairDataset(Dataset):
         pos_action, pos_mask = _load_window(pos_traj, action_key, int(pos_ref["action_step"]), horizon)
         neg_action, neg_mask = _load_window(neg_traj, action_key, int(neg_ref["action_step"]), horizon)
 
-        idm_idx = int(row["idm"]["index"])
-        idm_action = np.asarray(self.idm_actions[idm_idx], dtype=np.float32)[:horizon]
-        idm_mask = np.ones((len(idm_action),), dtype=np.float32)
-        if len(idm_action) < horizon:
-            pad = np.zeros((horizon - len(idm_action), idm_action.shape[-1]), dtype=np.float32)
-            idm_action = np.concatenate([idm_action, pad], axis=0)
-            idm_mask = np.concatenate([idm_mask, np.zeros((horizon - len(idm_mask),), dtype=np.float32)], axis=0)
-
-        mask = np.minimum(np.minimum(pos_mask, neg_mask), idm_mask)
-        return {
+        mask = np.minimum(pos_mask, neg_mask)
+        sample = {
             "sample_type": "preference",
             "row": row,
             "images": loaded.images,
@@ -285,9 +279,21 @@ class PreferencePairDataset(Dataset):
             "action_offset": int(row["action_offset"]),
             "positive_action": pos_action,
             "negative_action": neg_action,
-            "idm_action": idm_action,
             "target_mask": mask,
         }
+        if self.idm_actions is not None:
+            if "idm" not in row or "index" not in row["idm"]:
+                raise KeyError("Preference row has no idm.index but idm_actions_path was provided")
+            idm_idx = int(row["idm"]["index"])
+            idm_action = np.asarray(self.idm_actions[idm_idx], dtype=np.float32)[:horizon]
+            idm_mask = np.ones((len(idm_action),), dtype=np.float32)
+            if len(idm_action) < horizon:
+                pad = np.zeros((horizon - len(idm_action), idm_action.shape[-1]), dtype=np.float32)
+                idm_action = np.concatenate([idm_action, pad], axis=0)
+                idm_mask = np.concatenate([idm_mask, np.zeros((horizon - len(idm_mask),), dtype=np.float32)], axis=0)
+            sample["idm_action"] = idm_action
+            sample["target_mask"] = np.minimum(mask, idm_mask)
+        return sample
 
     def close(self) -> None:
         self.cache.close()
@@ -372,10 +378,11 @@ class GrootPreferenceCollator:
                 [sample["negative_action"] for sample in batch],
                 states,
             )
-            out["idm_action"] = self._normalize_actions(
-                [sample["idm_action"] for sample in batch],
-                states,
-            )
+            if "idm_action" in batch[0]:
+                out["idm_action"] = self._normalize_actions(
+                    [sample["idm_action"] for sample in batch],
+                    states,
+                )
         return out
 
 
@@ -537,6 +544,9 @@ def idm_nce_loss(
     tau: float,
     lambda_gripper: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if "idm_action" not in batch:
+        zero = pred_actions.sum() * 0.0
+        return zero, {}
     offsets = batch["action_offset"].to(pred_actions.device)
     idm = batch["idm_action"].to(pred_actions.device)
     neg = batch["negative_action"].to(pred_actions.device)
@@ -623,12 +633,16 @@ def evaluate(
                 tau=args.tau_onset,
                 lambda_gripper=args.lambda_gripper_nce,
             )
-            loss_idm, idm_metrics = idm_nce_loss(
-                pred,
-                batch,
-                tau=args.tau_idm,
-                lambda_gripper=args.lambda_gripper_nce,
-            )
+            if args.lambda_idm > 0:
+                loss_idm, idm_metrics = idm_nce_loss(
+                    pred,
+                    batch,
+                    tau=args.tau_idm,
+                    lambda_gripper=args.lambda_gripper_nce,
+                )
+            else:
+                loss_idm = pred.sum() * 0.0
+                idm_metrics = {}
             add("loss_onset", loss_onset)
             add("loss_idm", loss_idm)
             for key, value in {**onset_metrics, **idm_metrics}.items():
@@ -678,14 +692,73 @@ def _save_checkpoint(
     LOGGER.info("Saved checkpoint: %s", ckpt_dir)
 
 
+CONFIG_SECTIONS = {
+    "paths",
+    "model",
+    "training",
+    "loss",
+    "lora",
+    "runtime",
+    "wandb",
+}
+
+
+def _load_config(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    cfg_path = Path(path)
+    with cfg_path.open() as f:
+        if cfg_path.suffix.lower() == ".json":
+            return json.load(f)
+        import yaml
+
+        return yaml.safe_load(f) or {}
+
+
+def _flatten_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+    for key, value in cfg.items():
+        if key in CONFIG_SECTIONS and isinstance(value, dict):
+            flat.update(value)
+        else:
+            flat[key] = value
+    return flat
+
+
+def _apply_config(args: argparse.Namespace) -> argparse.Namespace:
+    flat = _flatten_config(_load_config(args.config))
+    unknown = sorted(k for k in flat if not hasattr(args, k))
+    if unknown:
+        raise ValueError(f"Unknown config keys: {unknown}")
+    for key, value in flat.items():
+        setattr(args, key, value)
+    return args
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    missing = []
+    if not args.success_only:
+        missing.append("success_only")
+    if not args.output_dir:
+        missing.append("output_dir")
+    if args.lambda_onset > 0 or args.lambda_idm > 0:
+        if not args.preference_pairs:
+            missing.append("preference_pairs")
+    if args.lambda_idm > 0 and not args.idm_actions:
+        missing.append("idm_actions")
+    if missing:
+        raise ValueError(f"Missing required train settings: {', '.join(missing)}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default=None, help="YAML/JSON training config.")
     parser.add_argument("--base-model-path", default="0xAnkitSingh/GR00T-N1.6-LIBERO")
     parser.add_argument("--embodiment-tag", default="LIBERO_PANDA")
-    parser.add_argument("--preference-pairs", required=True)
-    parser.add_argument("--idm-actions", required=True)
-    parser.add_argument("--success-only", required=True)
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--preference-pairs", default=None)
+    parser.add_argument("--idm-actions", default=None)
+    parser.add_argument("--success-only", default=None)
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--success-batch-size", type=int, default=1)
     parser.add_argument("--preference-batch-size", type=int, default=1)
@@ -729,7 +802,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--validate-config", action="store_true", help="Validate config/arguments and exit before loading GR00T.")
+    args = parser.parse_args()
+    args = _apply_config(args)
+    _validate_args(args)
+    return args
 
 
 def main() -> None:
@@ -737,6 +814,9 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     _setup_logging(output_dir)
     _load_dotenv()
+    if args.validate_config:
+        LOGGER.info("Config validated: %s", json.dumps(vars(args), indent=2, sort_keys=True, default=str))
+        return
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -772,20 +852,29 @@ def main() -> None:
         action_window=args.chunk_size,
         cache_size=args.cache_size,
     )
-    preference_dataset = PreferencePairDataset(
-        Path(args.preference_pairs),
-        idm_actions_path=Path(args.idm_actions),
-        cache_size=args.cache_size,
+    use_preference = bool(args.preference_pairs and (args.lambda_onset > 0 or args.lambda_idm > 0))
+    preference_dataset = (
+        PreferencePairDataset(
+            Path(args.preference_pairs),
+            idm_actions_path=Path(args.idm_actions) if args.idm_actions else None,
+            cache_size=args.cache_size,
+        )
+        if use_preference
+        else None
     )
     success_train, success_eval = _split_dataset(
         success_dataset,
         eval_ratio=args.eval_ratio,
         seed=args.seed,
     )
-    preference_train, preference_eval = _split_dataset(
-        preference_dataset,
-        eval_ratio=args.eval_ratio,
-        seed=args.seed + 1,
+    preference_train, preference_eval = (
+        _split_dataset(
+            preference_dataset,
+            eval_ratio=args.eval_ratio,
+            seed=args.seed + 1,
+        )
+        if preference_dataset is not None
+        else (None, None)
     )
     success_loader = DataLoader(
         success_train,
@@ -795,13 +884,17 @@ def main() -> None:
         collate_fn=collator,
         drop_last=True,
     )
-    preference_loader = DataLoader(
-        preference_train,
-        batch_size=args.preference_batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collator,
-        drop_last=True,
+    preference_loader = (
+        DataLoader(
+            preference_train,
+            batch_size=args.preference_batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=collator,
+            drop_last=True,
+        )
+        if preference_train is not None
+        else None
     )
     success_eval_loader = (
         DataLoader(
@@ -832,16 +925,17 @@ def main() -> None:
         len(success_dataset),
         len(success_train),
         0 if success_eval is None else len(success_eval),
-        len(preference_dataset),
-        len(preference_train),
+        0 if preference_dataset is None else len(preference_dataset),
+        0 if preference_train is None else len(preference_train),
         0 if preference_eval is None else len(preference_eval),
     )
 
     if args.dry_run:
         success_batch = next(iter(success_loader))
-        preference_batch = next(iter(preference_loader))
         LOGGER.info("Dry-run success input keys: %s", sorted(success_batch["inputs"].keys()))
-        LOGGER.info("Dry-run preference input keys: %s", sorted(preference_batch["inputs"].keys()))
+        if preference_loader is not None:
+            preference_batch = next(iter(preference_loader))
+            LOGGER.info("Dry-run preference input keys: %s", sorted(preference_batch["inputs"].keys()))
         return
 
     optimizer = torch.optim.AdamW(
@@ -870,26 +964,19 @@ def main() -> None:
         )
 
     success_iter = _cycle(success_loader)
-    preference_iter = _cycle(preference_loader)
+    preference_iter = _cycle(preference_loader) if preference_loader is not None else None
     optimizer.zero_grad(set_to_none=True)
     running: dict[str, float] = {}
 
     pbar = tqdm(range(1, args.max_steps + 1), desc="GR00T preference fine-tune")
     for step in pbar:
         success_batch = _to_device(next(success_iter), device)
-        preference_batch = _to_device(next(preference_iter), device)
 
         success_inputs = _rec_to_dtype(success_batch["inputs"], dtype)
-        preference_inputs = _rec_to_dtype(preference_batch["inputs"], dtype)
 
         pred_success = sample_actions_with_grad(
             model,
             success_inputs,
-            num_inference_timesteps=args.num_inference_timesteps,
-        )
-        pred_preference = sample_actions_with_grad(
-            model,
-            preference_inputs,
             num_inference_timesteps=args.num_inference_timesteps,
         )
 
@@ -898,18 +985,32 @@ def main() -> None:
             success_batch,
             lambda_gripper=args.lambda_gripper_bc,
         )
-        loss_onset, onset_metrics = onset_nce_loss(
-            pred_preference,
-            preference_batch,
-            tau=args.tau_onset,
-            lambda_gripper=args.lambda_gripper_nce,
-        )
-        loss_idm, idm_metrics = idm_nce_loss(
-            pred_preference,
-            preference_batch,
-            tau=args.tau_idm,
-            lambda_gripper=args.lambda_gripper_nce,
-        )
+        loss_onset = loss_bc.sum() * 0.0
+        loss_idm = loss_bc.sum() * 0.0
+        onset_metrics: dict[str, torch.Tensor] = {}
+        idm_metrics: dict[str, torch.Tensor] = {}
+        if preference_iter is not None:
+            preference_batch = _to_device(next(preference_iter), device)
+            preference_inputs = _rec_to_dtype(preference_batch["inputs"], dtype)
+            pred_preference = sample_actions_with_grad(
+                model,
+                preference_inputs,
+                num_inference_timesteps=args.num_inference_timesteps,
+            )
+            if args.lambda_onset > 0:
+                loss_onset, onset_metrics = onset_nce_loss(
+                    pred_preference,
+                    preference_batch,
+                    tau=args.tau_onset,
+                    lambda_gripper=args.lambda_gripper_nce,
+                )
+            if args.lambda_idm > 0:
+                loss_idm, idm_metrics = idm_nce_loss(
+                    pred_preference,
+                    preference_batch,
+                    tau=args.tau_idm,
+                    lambda_gripper=args.lambda_gripper_nce,
+                )
 
         nce_scale = min(1.0, step / max(1, args.nce_warmup_steps))
         lambda_onset = args.lambda_onset * nce_scale
@@ -989,7 +1090,8 @@ def main() -> None:
     if wandb_run is not None:
         wandb_run.finish()
     success_dataset.close()
-    preference_dataset.close()
+    if preference_dataset is not None:
+        preference_dataset.close()
 
 
 if __name__ == "__main__":

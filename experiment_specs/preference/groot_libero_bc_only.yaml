@@ -1,0 +1,63 @@
+# GR00T-N1.6 LIBERO BC-only LoRA diagnostic.
+# Use this before any NCE loss to check whether the fine-tuning pipeline itself
+# preserves the base policy.
+
+paths:
+  success_only: train/outputs/groot_libero_chunk_preference_pairs_260508/success_only.jsonl
+  preference_pairs: null
+  idm_actions: null
+  output_dir: train/runs/groot_libero_bc_only_260608
+
+model:
+  base_model_path: 0xAnkitSingh/GR00T-N1.6-LIBERO
+  embodiment_tag: LIBERO_PANDA
+
+training:
+  max_steps: 10000
+  success_batch_size: 1
+  preference_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  warmup_steps: 500
+  lr_scheduler: cosine
+  max_grad_norm: 1.0
+  seed: 0
+  eval_ratio: 0.05
+  eval_steps: 500
+  eval_batches: 16
+  eval_seed: 12345
+  save_steps: 1000
+  logging_steps: 10
+
+loss:
+  chunk_size: 16
+  num_inference_timesteps: 4
+  lambda_bc: 1.0
+  lambda_onset: 0.0
+  lambda_idm: 0.0
+  lambda_gripper_bc: 1.0
+  lambda_gripper_nce: 1.0
+  tau_onset: 1.0
+  tau_idm: 1.0
+  nce_warmup_steps: 1000
+  invert_gripper: true
+
+lora:
+  use_lora: true
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_target_modules: q_proj,k_proj,v_proj,out_proj,fc1,fc2,to_q,to_k,to_v,to_out.0,proj_out_1,proj_out_2
+
+runtime:
+  num_workers: 0
+  cache_size: 32
+  bf16: true
+  tf32: true
+  dry_run: false
+
+wandb:
+  wandb_project: null
+  wandb_run_name: groot_libero_bc_only_260608
+  wandb_mode: online

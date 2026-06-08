@@ -4,7 +4,6 @@ Use these experiment specs instead of passing long option lists on the command l
 
 ```bash
 python3 train/idm/train.py --config experiment_specs/idm/libero_groot_goal_image_train.yaml
-python3 train/idm/cache_actions.py --config experiment_specs/idm/libero_groot_goal_image_cache.yaml
 python3 train/idm/evaluate.py --config experiment_specs/idm/libero_groot_goal_image_eval.yaml
 ```
 
@@ -17,12 +16,5 @@ python3 train/idm/evaluate.py --config experiment_specs/idm/libero_groot_goal_im
 - `runtime`: device, dataloader workers, npz cache, dotenv path.
 - `wandb`: logging project/run/mode.
 
-## Cache Config Sections
-
-- `paths`: preference pairs, trained IDM checkpoint, output directory.
-- `data`: preset and optional image/state key overrides.
-- `cache`: action clamp behavior.
-- `runtime`: device and npz cache size.
-
 For a new benchmark/model, add an entry to `IDM_DATA_PRESETS` in
-`train/idm/core.py`, then create a new train/cache config pair here.
+`train/idm/core.py`, then create a new train/eval config pair here.

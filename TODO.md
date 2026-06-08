@@ -13,9 +13,7 @@
   - `train/outputs/groot_libero_chunk_preference_pairs_260508/preference_pairs.jsonl`
   - `train/outputs/groot_libero_chunk_preference_pairs_260508/success_only.jsonl`
 - 이전 state-only IDM manifest는 제거 대상이다.
-- 다음 IDM manifest:
-  - `train/idm/outputs/groot_libero_chunk_preference_pairs_goal_image_idm_h3_260526/preference_pairs_with_idm.jsonl`
-  - `train/idm/outputs/groot_libero_chunk_preference_pairs_goal_image_idm_h3_260526/idm_actions.npz`
+- IDM은 현재 action cache를 만들지 않고 train/evaluate/replay debug로 품질을 먼저 확인한다.
 - 현재 학습 run:
   - `train/runs/groot_libero_pref_lora_260513`
   - LoRA-only
@@ -57,9 +55,9 @@ idm pos/rot/gripper max: [ 1.238,  1.397,  1.331, ...,  1.466]
 
 우선 조치:
 
-- goal-image IDM output을 `tanh * action_limit`로 bound하고 cache 단계에서도 `[-1, 1]`로 clamp한다.
+- goal-image IDM output을 `tanh * action_limit`로 bound한다.
 - gripper는 native 변환 후 `[0, 1]` 범위도 확인한다.
-- clamp 전/후 action range를 train log에 남긴다.
+- clamp 전/후 action range를 train/eval log에 남긴다.
 
 ### 2. NCE가 원하는 방향으로 학습되지 않음
 
@@ -94,6 +92,7 @@ action_offset=13: 987 / 2372
 policy_obs_step=0: 1133 / 2372
 same vla_input duplicated groups: 591
 duplicated rows in those groups: 1653
+positive/negative action gap <= 0.1: 910 / 2372 = 38.4%
 ```
 
 - 같은 failure observation에 여러 success target이 붙는 경우가 많다.
@@ -106,6 +105,7 @@ duplicated rows in those groups: 1653
 - `action_offset <= 8` 또는 `<= 10` ablation을 만든다.
 - `target_action_gap <= 0.1` 같은 약한 pair는 제거하거나 downweight한다.
 - suite/task 균형 sampling을 넣는다.
+- `train/analyze_libero_preference_pairs.py`로 새 manifest마다 offset/dup/action gap summary를 저장한다.
 
 ### 4. Success-only BC 보존이 너무 약함
 
@@ -167,24 +167,30 @@ E. BC + onset NCE + IDM NCE(off 또는 very small lambda)
 - [x] generic goal-image IDM 구조 생성.
   - `train/idm/core.py`
   - `train/idm/train.py`
-  - `train/idm/cache_actions.py`
   - 기본 preset: `libero:groot`
-- [x] IDM 학습/캐시 설정을 config 파일로 분리.
+- [x] IDM 학습/평가 설정을 config 파일로 분리.
   - `experiment_specs/idm/libero_groot_goal_image_train.yaml`
-  - `experiment_specs/idm/libero_groot_goal_image_cache.yaml`
-- [ ] goal-image IDM 학습 실행.
+  - `experiment_specs/idm/libero_groot_goal_image_eval.yaml`
+- [x] goal-image IDM 학습/검증 실행.
   - 입력: current image observation, goal image observation
   - 출력: A에서 B로 가는 K-step action chunk
-  - 기본은 image-only, `--include-state`는 ablation 용도
-- [ ] clamped goal-image IDM cache를 새로 생성.
+  - h1/h5 debug 결과를 replay와 offline metric으로 확인
+- [x] GR00T preference fine-tuning을 YAML config 기반으로 변경.
+  - `experiment_specs/preference/groot_libero_bc_only.yaml`
+  - `experiment_specs/preference/groot_libero_onset_only.yaml`
+- [x] `lambda_idm=0`일 때 IDM action 없이 학습 가능하도록 optional화.
+- [x] preference pair manifest diagnostic 추가.
+  - `train/analyze_libero_preference_pairs.py`
 - [ ] BC-only run 실행.
   - `lambda_onset=0`
   - `lambda_idm=0`
   - checkpoint별 benchmark 확인
+- [ ] BC-only checkpoint benchmark eval.
 - [ ] onset-only run 실행.
   - `lambda_idm=0`
   - `onset_d_pos < onset_d_neg`가 되는지 확인
-- [ ] IDM run은 clamp 이후에만 실행.
+- [ ] onset-only checkpoint benchmark eval.
+- [ ] IDM을 LoRA loss에 다시 붙이는 실험은 replay 검증 이후에만 실행.
   - 시작값: `lambda_idm=0.01` 또는 `0.02`
   - `lambda_idm=0.05`는 현재 기준으로 강할 수 있음
 - [ ] preference pair filtered dataset 생성.
@@ -268,14 +274,14 @@ train/idm/core.py
 train/idm/train.py
   --config experiment_specs/idm/libero_groot_goal_image_train.yaml
 
-train/idm/cache_actions.py
-  --config experiment_specs/idm/libero_groot_goal_image_cache.yaml
-  preference_pairs.jsonl -> preference_pairs_with_idm.jsonl + idm_actions.npz
+train/idm/evaluate.py
+  --config experiment_specs/idm/libero_groot_goal_image_eval.yaml
+  offline action prediction + optional LIBERO replay validation
 ```
 
 ## 보류 / 제거한 이전 기록
 
-- 이전 rank-triplet manifest는 참고용으로만 유지한다.
+- 이전 rank-triplet manifest와 builder는 제거했다.
 - CALVIN / X-VLA LoRA 실험 로그는 이 TODO에서 다루지 않는다.
 - smoke run 이전 메모리는 현재 진단 이후 우선순위가 낮아 제거했다.
 - 현재 문서는 GR00T/LIBERO preference fine-tuning의 성능 하락 원인 분리와 다음 실험만 추적한다.
