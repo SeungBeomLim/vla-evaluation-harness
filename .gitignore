@@ -53,3 +53,9 @@ src/vla_eval/_version.py
 
 # Leaderboard local cache (extract.py / refine.py working files)
 leaderboard/.cache/
+
+# Local experiment artifacts
+wandb/
+train/idm/runs/
+train/idm/outputs/
+.codex

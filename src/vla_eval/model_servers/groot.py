@@ -37,7 +37,9 @@ from vla_eval.specs import (
     LANGUAGE,
     POSITION_DELTA,
     RAW,
+    ROTATION_AA,
     ROTATION_EULER,
+    STATE_EEF_POS_AA_GRIP,
     DimSpec,
 )
 from vla_eval.types import Action, Observation
@@ -54,6 +56,7 @@ class GR00TModelServer(PredictModelServer):
     def __init__(
         self,
         model_path: str = "nvidia/GR00T-N1.6-3B",
+        lora_path: str | None = None,
         embodiment_tag: str = "GR1",
         video_key: str | None = None,
         action_keys: list[str] | None = None,
@@ -68,6 +71,7 @@ class GR00TModelServer(PredictModelServer):
     ) -> None:
         super().__init__(chunk_size=chunk_size, action_ensemble=action_ensemble, **kwargs)
         self.model_path = model_path
+        self.lora_path = lora_path
         self.embodiment_tag = embodiment_tag
         self.video_key = video_key  # None = auto-detect from modality config
         self.action_keys = action_keys
@@ -84,6 +88,10 @@ class GR00TModelServer(PredictModelServer):
         self._state_dims: dict[str, int] = {}
 
         self._init_policy()
+
+    def _is_libero_panda(self) -> bool:
+        tag = self.embodiment_tag
+        return tag == "LIBERO_PANDA" or getattr(tag, "name", None) == "LIBERO_PANDA" or getattr(tag, "value", None) == "libero_panda"
 
     # Data files that Isaac-GR00T's pip package omits from Eagle backbone.
     _EAGLE_DATA_FILES = [
@@ -109,6 +117,9 @@ class GR00TModelServer(PredictModelServer):
         """
         import gr00t.model.modules as _mod
 
+        from pathlib import Path
+        import shutil
+
         eagle_dir = os.path.join(
             os.path.dirname(_mod.__file__),
             "nvidia",
@@ -117,6 +128,30 @@ class GR00TModelServer(PredictModelServer):
         missing = [f for f in cls._EAGLE_DATA_FILES if not os.path.isfile(os.path.join(eagle_dir, f))]
         if not missing:
             return
+
+        def _complete_data_dir(path: Path) -> bool:
+            return all((path / fname).is_file() for fname in cls._EAGLE_DATA_FILES)
+
+        candidates: list[Path] = []
+        override = os.environ.get("GROOT_EAGLE_DATA_DIR")
+        if override:
+            candidates.append(Path(override).expanduser())
+
+        uv_cache = Path.home() / ".cache" / "uv"
+        for root_name in ("git-v0/checkouts", "archive-v0"):
+            root = uv_cache / root_name
+            if root.is_dir():
+                candidates.extend(root.glob("**/gr00t/model/modules/nvidia/Eagle-Block2A-2B-v2"))
+
+        for candidate in candidates:
+            if not _complete_data_dir(candidate):
+                continue
+            os.makedirs(eagle_dir, exist_ok=True)
+            for fname in missing:
+                shutil.copy2(candidate / fname, os.path.join(eagle_dir, fname))
+            logger.info("Copied missing Eagle data files from %s", candidate)
+            return
+
         import urllib.request
 
         base_url = (
@@ -152,6 +187,19 @@ class GR00TModelServer(PredictModelServer):
             device="cuda:0",
             strict=False,
         )
+        if self.lora_path:
+            import torch
+            from peft import PeftModel
+
+            logger.info("Applying GR00T LoRA adapter from %s", self.lora_path)
+            self._policy.model = PeftModel.from_pretrained(
+                self._policy.model,
+                self.lora_path,
+                is_trainable=False,
+            )
+            self._policy.model.eval()
+            self._policy.model.to(device="cuda:0", dtype=torch.bfloat16)
+
         self._modality_config = self._policy.get_modality_config()
         self._language_key = self._policy.language_key
 
@@ -164,11 +212,12 @@ class GR00TModelServer(PredictModelServer):
         self._state_dims = {k: len(v["mean"]) for k, v in state_stats.items()}
 
         logger.info(
-            "GR00T model loaded. video_keys=%s, state_keys=%s (dims=%s), action_keys=%s",
+            "GR00T model loaded. video_keys=%s, state_keys=%s (dims=%s), action_keys=%s, lora=%s",
             self._modality_config["video"].modality_keys,
             self._modality_config["state"].modality_keys,
             self._state_dims,
             self._modality_config["action"].modality_keys,
+            self.lora_path,
         )
 
     def get_observation_params(self) -> dict[str, Any]:
@@ -178,14 +227,30 @@ class GR00TModelServer(PredictModelServer):
             "success_mode": "accumulate",
             "deterministic_episodes": False,
         }
+        if self._is_libero_panda():
+            params.update(
+                {
+                    "send_wrist_image": True,
+                    "quat_no_antipodal": True,
+                }
+            )
         params.update(self._extra_obs_params)
         return params
 
     def get_action_spec(self) -> dict[str, DimSpec]:
         gripper = GRIPPER_CLOSE_POS if self.invert_gripper else GRIPPER_01
+        if self._is_libero_panda():
+            return {"position": POSITION_DELTA, "rotation": ROTATION_AA, "gripper": gripper}
         return {"position": POSITION_DELTA, "rotation": ROTATION_EULER, "gripper": gripper}
 
     def get_observation_spec(self) -> dict[str, DimSpec]:
+        if self._is_libero_panda():
+            return {
+                "agentview": IMAGE_RGB,
+                "wrist": IMAGE_RGB,
+                "state": STATE_EEF_POS_AA_GRIP,
+                "language": LANGUAGE,
+            }
         return {"image": IMAGE_RGB, "state": RAW, "language": LANGUAGE}
 
     _BRIDGE_DEFAULT_ROT = np.array([[0, 0, 1.0], [0, 1.0, 0], [-1.0, 0, 0]])
@@ -243,9 +308,13 @@ class GR00TModelServer(PredictModelServer):
                 continue
             state_arr = np.asarray(raw_state, dtype=np.float32).flatten()
 
+            # LIBERO already provides [xyz, axis-angle, gripper_qpos2], which
+            # matches the GR00T LIBERO modality split into x/y/z/roll/pitch/yaw/gripper.
+            if self._is_libero_panda():
+                pass
             # State transformation for SimplerEnv.
             # eef_pos from ManiSkill2: [x, y, z, qw, qx, qy, qz, gripper_openness]
-            if len(state_arr) >= 8:
+            elif len(state_arr) >= 8:
                 if self.bridge_rotation:
                     # WidowX: convert quaternion to bridge-frame euler angles
                     quat_xyzw = quat_wxyz_to_xyzw(state_arr[3:7])

@@ -34,6 +34,20 @@ def _stack(values: list[np.ndarray], *, dtype: Any | None = None) -> np.ndarray:
     return arr
 
 
+def _pad_2d_chunks(values: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pad variable-length 2-D chunks into a dense archive-friendly array."""
+    arrays = [np.asarray(v, dtype=np.float32) for v in values]
+    lengths = np.asarray([a.shape[0] if a.ndim > 0 else 1 for a in arrays], dtype=np.int32)
+    dims = np.asarray([a.shape[1] if a.ndim > 1 else 1 for a in arrays], dtype=np.int32)
+    max_len = int(lengths.max(initial=0))
+    max_dim = int(dims.max(initial=0))
+    padded = np.full((len(arrays), max_len, max_dim), np.nan, dtype=np.float32)
+    for i, arr in enumerate(arrays):
+        arr2d = arr.reshape(1, -1) if arr.ndim == 1 else arr.reshape(arr.shape[0], -1)
+        padded[i, : arr2d.shape[0], : arr2d.shape[1]] = arr2d
+    return padded, lengths, dims
+
+
 def _pad_video_frames(frames: np.ndarray, block: int = 16) -> np.ndarray:
     """Pad video frames to codec-friendly dimensions without resizing content."""
     h, w = frames.shape[1:3]
@@ -116,6 +130,19 @@ class EpisodeArtifactRecorder:
         self.server_actions: list[np.ndarray] = []
         self.env_actions: list[np.ndarray] = []
         self.model_native_actions: list[np.ndarray] = []
+        self.action_chunk_id: list[int] = []
+        self.action_chunk_start_step: list[int] = []
+        self.action_chunk_offset: list[int] = []
+        self.action_chunk_size: list[int] = []
+        self.action_is_chunk_start: list[bool] = []
+        self.action_from_buffer: list[bool] = []
+        self.action_model_output_index: list[int] = []
+        self.model_action_chunks: list[np.ndarray] = []
+        self.model_native_action_chunks: list[np.ndarray] = []
+        self.model_action_chunk_ids: list[int] = []
+        self.model_action_chunk_start_steps: list[int] = []
+        self.model_native_action_chunk_ids: list[int] = []
+        self.model_native_action_chunk_start_steps: list[int] = []
         self.step_idx: list[int] = []
         self.language_ids: list[int] = []
         self.subtask_idx: list[int] = []
@@ -176,6 +203,32 @@ class EpisodeArtifactRecorder:
         if native_action is not None:
             self.model_native_actions.append(native_action.astype(np.float32, copy=True).reshape(-1))
 
+        action_metadata = action.get("action_metadata") or {}
+        chunk_id = int(action_metadata.get("chunk_id", -1))
+        chunk_start_step = int(action_metadata.get("chunk_start_step", step))
+        chunk_offset = int(action_metadata.get("chunk_offset", 0))
+        chunk_size = int(action_metadata.get("chunk_size", 1))
+        is_chunk_start = bool(action_metadata.get("is_chunk_start", chunk_offset == 0))
+        self.action_chunk_id.append(chunk_id)
+        self.action_chunk_start_step.append(chunk_start_step)
+        self.action_chunk_offset.append(chunk_offset)
+        self.action_chunk_size.append(chunk_size)
+        self.action_is_chunk_start.append(is_chunk_start)
+        self.action_from_buffer.append(bool(action_metadata.get("from_buffer", False)))
+        self.action_model_output_index.append(int(action_metadata.get("model_output_index", chunk_offset)))
+
+        model_action_chunk = _array_or_none(action.get("model_action_chunk"))
+        if model_action_chunk is not None and is_chunk_start:
+            self.model_action_chunks.append(model_action_chunk.astype(np.float32, copy=True))
+            self.model_action_chunk_ids.append(chunk_id)
+            self.model_action_chunk_start_steps.append(chunk_start_step)
+
+        model_native_action_chunk = _array_or_none(action.get("model_native_action_chunk"))
+        if model_native_action_chunk is not None and is_chunk_start:
+            self.model_native_action_chunks.append(model_native_action_chunk.astype(np.float32, copy=True))
+            self.model_native_action_chunk_ids.append(chunk_id)
+            self.model_native_action_chunk_start_steps.append(chunk_start_step)
+
         language = str(obs.get("task_description", ""))
         self.language_ids.append(self._id_for(self.language_table, self._language_to_id, language))
 
@@ -200,6 +253,13 @@ class EpisodeArtifactRecorder:
             "subtask_done": np.asarray(self.subtask_done, dtype=np.bool_),
             "episode_done": np.asarray(self.episode_done, dtype=np.bool_),
             "current_subtask_id": np.asarray(self.current_subtask_ids, dtype=np.int32),
+            "action_chunk_id": np.asarray(self.action_chunk_id, dtype=np.int32),
+            "action_chunk_start_step": np.asarray(self.action_chunk_start_step, dtype=np.int32),
+            "action_chunk_offset": np.asarray(self.action_chunk_offset, dtype=np.int32),
+            "action_chunk_size": np.asarray(self.action_chunk_size, dtype=np.int32),
+            "action_is_chunk_start": np.asarray(self.action_is_chunk_start, dtype=np.bool_),
+            "action_from_buffer": np.asarray(self.action_from_buffer, dtype=np.bool_),
+            "action_model_output_index": np.asarray(self.action_model_output_index, dtype=np.int32),
         }
         for view, frames in self.images.items():
             arrays[f"image_{view}"] = _stack(frames, dtype=np.uint8)
@@ -211,6 +271,26 @@ class EpisodeArtifactRecorder:
             arrays["env_action"] = _stack(self.env_actions, dtype=np.float32)
         if self.model_native_actions:
             arrays["model_native_action"] = _stack(self.model_native_actions, dtype=np.float32)
+        if self.model_action_chunks:
+            chunk_arr, chunk_len, chunk_dim = _pad_2d_chunks(self.model_action_chunks)
+            arrays["model_action_chunk"] = chunk_arr
+            arrays["model_action_chunk_length"] = chunk_len
+            arrays["model_action_chunk_dim"] = chunk_dim
+            arrays["model_action_chunk_id"] = np.asarray(self.model_action_chunk_ids, dtype=np.int32)
+            arrays["model_action_chunk_start_step"] = np.asarray(
+                self.model_action_chunk_start_steps,
+                dtype=np.int32,
+            )
+        if self.model_native_action_chunks:
+            native_chunk_arr, native_chunk_len, native_chunk_dim = _pad_2d_chunks(self.model_native_action_chunks)
+            arrays["model_native_action_chunk"] = native_chunk_arr
+            arrays["model_native_action_chunk_length"] = native_chunk_len
+            arrays["model_native_action_chunk_dim"] = native_chunk_dim
+            arrays["model_native_action_chunk_id"] = np.asarray(self.model_native_action_chunk_ids, dtype=np.int32)
+            arrays["model_native_action_chunk_start_step"] = np.asarray(
+                self.model_native_action_chunk_start_steps,
+                dtype=np.int32,
+            )
         return arrays
 
     def finalize(self, episode_result: dict[str, Any]) -> dict[str, Any]:
@@ -261,6 +341,30 @@ class EpisodeArtifactRecorder:
                 "env_action": {
                     "source": "benchmark action after benchmark-specific conversion, when provided",
                     "dims": int(arrays["env_action"].shape[-1]) if "env_action" in arrays else None,
+                },
+                "model_action_chunk": {
+                    "source": "full server action chunk attached at chunk-start steps, padded with NaN",
+                    "shape": list(arrays["model_action_chunk"].shape) if "model_action_chunk" in arrays else None,
+                },
+                "model_native_action_chunk": {
+                    "source": "full native model action chunk attached at chunk-start steps, padded with NaN",
+                    "shape": (
+                        list(arrays["model_native_action_chunk"].shape)
+                        if "model_native_action_chunk" in arrays
+                        else None
+                    ),
+                },
+            },
+            "action_provenance": {
+                "source": "model server chunk metadata recorded per environment step",
+                "fields": {
+                    "action_chunk_id": "monotonic chunk/inference id within each episode",
+                    "action_chunk_start_step": "environment step whose observation triggered the model inference",
+                    "action_chunk_offset": "index inside the emitted action chunk",
+                    "action_chunk_size": "number of actions in the emitted chunk",
+                    "action_is_chunk_start": "true when this step triggered a fresh model inference",
+                    "action_from_buffer": "true when the action was served from a previous chunk buffer",
+                    "action_model_output_index": "index in the model output action sequence",
                 },
             },
             "files": files,

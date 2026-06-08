@@ -666,6 +666,8 @@ v1~v6b까지는 기존 squared-hinge triplet loss 계열 실험으로 관리했�
 | `v` | 기존 triplet 계열 | `--loss_type triplet_squared_hinge` |
 | `d` | 거리 기반 probabilistic NCE | `--loss_type distance_probabilistic_nce` |
 | `d_kl` | 거리 기반 probabilistic NCE + teacher preference KL | `--loss_type distance_probabilistic_nce --use_preference_kl` |
+| `e` | 임베딩 기반 probabilistic NCE | `--loss_type embedding_probabilistic_nce` |
+| `e_kl` | 임베딩 기반 probabilistic NCE + teacher preference KL | `--loss_type embedding_probabilistic_nce --use_preference_kl` |
 
 새 loss 실험의 목적:
 
@@ -673,33 +675,105 @@ v1~v6b까지는 기존 squared-hinge triplet loss 계열 실험으로 관리했�
 - positive와 negative 사이의 거리 차이를 확률적 preference로 해석한다.
 - base 성능을 보존하면서 실패 action보다 성공 action에 더 가까워지도록 약하게 유도한다.
 - KL 실험에서는 frozen base teacher의 preference 분포를 reference로 사용해 base behavior 파괴를 더 줄일 수 있는지 확인한다.
+- 이후 `e` 계열에서는 raw action distance 대신 학습 가능한 action embedding의 cosine similarity로 positive/negative preference를 계산한다.
 
-예정 실험:
+### 완료된 새 loss 실험
 
-| run | 목적 | 주요 차이 |
-|---|---|---|
-| `xvla_calvin_lora_d_260502` | KL 없이 distance-based NCE만 평가 | `loss_nce = softplus((d_pos - d_neg) / tau)` |
-| `xvla_calvin_lora_d_kl_260502` | distance-based NCE에 teacher KL 추가 | student preference가 frozen base preference에서 과하게 벗어나지 않도록 regularization |
-
-두 실험은 loss 변경 효과를 보기 위해 단순한 no-reweight 조건으로 시작한다.
+네 실험 모두 loss 변경 효과를 보기 위해 단순한 no-reweight 조건으로 진행했다.
 
 - LoRA-only 유지
 - `batch_size=4`
 - `iters=10000`
 - `freeze_steps=0`
 - triplet reweight는 사용하지 않는다.
+- checkpoint: `ckpt-10000`
+- CALVIN benchmark: 1000 sequences, 4 shards, rollout video 저장
 
 여기서 reweight는 `--use_triplet_balance_weights`로 켜는 frequency/confidence 기반 sample weighting 전체를 의미한다.
 이전 v4/v5/v6/v6b에서 사용한 `triplet_weight_min=0.75`는 이 reweight 안에서 frequent task의 downweight를 완화하기 위한 하한 cap이었다.
-이번 `d` / `d_kl` 실험에서는 `--use_triplet_balance_weights` 자체를 넣지 않는다.
+이번 `d` / `d_kl` / `e` / `e_kl` 실험에서는 `--use_triplet_balance_weights` 자체를 넣지 않았다.
+
+공통 세팅:
+
+| setting | value |
+|---|---:|
+| manifest | `train/outputs/xvla_calvin_base_v2_260427` |
+| LoRA-only | true |
+| batch size | 4 |
+| iters | 10000 |
+| freeze steps | 0 |
+| triplet reweight | disabled |
+| lambda_pos | 1.0 |
+| lambda_nce | 1.0 |
+
+run별 loss 세팅:
+
+| run | output_dir | loss_type | tau | KL | lambda_kl | extra |
+|---|---|---|---:|---:|---:|---|
+| `d` | `train/runs/xvla_calvin_lora_d_260502` | `distance_probabilistic_nce` | 1.0 | false | 0.0 | `lambda_gripper_nce=1.0` |
+| `d_kl` | `train/runs/xvla_calvin_lora_d_kl_260502` | `distance_probabilistic_nce` | 1.0 | true | 1.0 | `lambda_gripper_nce=1.0` |
+| `e` | `train/runs/xvla_calvin_lora_e_260503` | `embedding_probabilistic_nce` | 0.07 | false | 0.0 | embed dim 64, hidden 128, LR 1e-4 |
+| `e_kl` | `train/runs/xvla_calvin_lora_e_kl_260503` | `embedding_probabilistic_nce` | 0.07 | true | 1.0 | embed dim 64, hidden 128, LR 1e-4 |
+
+Benchmark 결과:
+
+| run | full success | first-subtask success | avg completed |
+|---|---:|---:|---:|
+| base | 73.6% | 95.2% | 4.295 |
+| v5b | 65.2% | 94.1% | 4.030 |
+| v6b | 66.2% | 95.3% | 4.094 |
+| d | 63.9% | 94.0% | 3.994 |
+| d_kl | 61.5% | 93.1% | 3.925 |
+| e | 57.3% | 93.3% | 3.798 |
+| e_kl | 57.8% | 93.0% | 3.784 |
+
+step별 success:
+
+| run | step 1/5 | step 2/5 | step 3/5 | step 4/5 | step 5/5 |
+|---|---:|---:|---:|---:|---:|
+| d | 94.0% | 87.8% | 81.0% | 72.7% | 63.9% |
+| d_kl | 93.1% | 86.6% | 79.9% | 71.4% | 61.5% |
+| e | 93.3% | 85.2% | 76.4% | 67.6% | 57.3% |
+| e_kl | 93.0% | 84.3% | 76.0% | 67.3% | 57.8% |
+
+학습 summary:
+
+| run | final eval total | eval BC/pos | eval NCE | eval KL | final grad norm |
+|---|---:|---:|---:|---:|---:|
+| d | 0.2052 | 0.1766 | 0.0285 | - | 0.148 |
+| d_kl | 0.2077 | 0.1748 | 0.0297 | 0.0032 | 0.069 |
+| e | 0.1692 | 0.1681 | 0.0011 | - | 0.047 |
+| e_kl | 0.1845 | 0.1705 | 0.0010 | 0.0131 | 0.038 |
+
+`e` 계열 sanity check:
+
+- `emb_sim_gap = sim(pred, positive) - sim(pred, negative)`가 학습 중 커지는지 확인한다.
+- `emb_prob_pos`가 초반부터 1.0에 붙으면 temperature가 너무 작거나 task가 너무 쉬운 것이다.
+- `emb_prob_pos`가 계속 0.5 근처면 embedding contrastive signal이 충분히 작동하지 않는 것이다.
+- `emb_raw_norm_*`와 `emb_raw_norm_std`로 embedding collapse 여부를 확인한다.
+
+`e` 계열 최종 로그:
+
+| run | eval sim_pos | eval sim_neg | eval sim_gap | eval logit_gap | train prob_pos | raw norm std |
+|---|---:|---:|---:|---:|---:|---:|
+| e | 0.270 | 0.009 | 0.260 | 3.719 | 0.99998 | 0.438 |
+| e_kl | 0.266 | 0.008 | 0.258 | 3.685 | 0.99999 | 0.454 |
+
+해석:
+
+- `d`는 새 loss 계열 중 가장 좋은 결과였지만, v5b/v6b보다 낮았다.
+- `d_kl`은 `d`보다 full success가 2.4 pp 낮았다. 이번 세팅에서는 `lambda_kl=1.0`이 correction을 보존하기보다는 성능을 더 누른 것으로 보인다.
+- `e` 계열은 train/eval loss는 낮았지만 benchmark는 크게 낮았다. action embedding NCE가 loss를 쉽게 줄이는 방향으로 학습되었지만, 실제 rollout action 품질 개선으로는 잘 이어지지 않은 것으로 보인다.
+- `e_kl`은 `e`보다 full success가 0.5 pp 높았지만 avg completed는 0.014 낮았다. KL 추가 효과는 제한적이었다.
+- 현재 기준으로는 새 loss 계열보다 기존 LoRA-only hinge 계열의 v6b가 더 좋은 trade-off다.
 
 ## 다음 확인할 것
 
 - v5 `ckpt-3000` benchmark를 확인한다. v5 best eval loss가 step 2400 근처였기 때문에 final checkpoint보다 나을 가능성이 있다.
-- 다음 `d` / `d_kl` 실험은 LoRA-only, batch 4, 10000 steps, freeze 0, no-reweight 조건으로 진행한다.
 - `push_blue_block_right`가 계속 회복되지 않으므로, 해당 task의 triplet event 품질과 negative type을 따로 확인한다.
-- v5b에서 no-reweight가 일부 push correction을 살렸지만 base task를 흔들었으므로, reweight를 완전히 끄기보다는 `triplet_weight_min`을 0.75보다 조금 높이거나 task-agnostic hard negative clipping을 우선 검토한다.
-- v5b/v6b 모두 eval loss에서 gripper 항이 여전히 크므로, 다음 실험에서 `lambda_gripper` 분리 또는 gripper loss clipping을 검토한다.
+- `d_kl`은 KL을 켤 경우 `lambda_kl=1.0`이 강했을 수 있으므로, 재시도한다면 `lambda_kl=0.05~0.1`부터 확인한다.
+- `e` 계열은 `tau=0.07`에서 train probability가 거의 1.0에 붙었으므로, 재시도한다면 `tau=0.1~0.5` sweep 또는 embedder LR 축소를 먼저 검토한다.
+- v5b/v6b 모두 eval loss에서 gripper 항이 여전히 크므로, 다음 실험에서 gripper loss clipping이나 NCE gripper weight 조정을 검토한다.
 
 ## 서버 모델 + 로컬 CALVIN 시뮬 연결 방법
 

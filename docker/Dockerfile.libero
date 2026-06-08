@@ -13,7 +13,7 @@ RUN uv pip install --no-cache-dir "torch==2.1.0+cpu" \
 RUN uv pip install --no-cache-dir \
         numpy==1.22.4 mujoco==3.2.3 robosuite==1.4.0 bddl==1.0.1 \
         Pillow scipy h5py pyyaml termcolor future easydict hydra-core \
-        "gym>=0.21,<0.27" matplotlib \
+        "gym>=0.21,<0.27" matplotlib imageio imageio-ffmpeg \
     && rm -rf ~/.cache/pip ~/.cache/uv
 
 # ── Clone LIBERO ───────────────────────────────────────────────────

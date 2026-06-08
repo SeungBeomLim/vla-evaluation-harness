@@ -10,7 +10,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from train.dataset_builder_v2 import RolloutDatasetBuilderV2
+from train.legacy_xvla_calvin.dataset_builder_v2 import RolloutDatasetBuilderV2
 
 
 def parse_args() -> argparse.Namespace:

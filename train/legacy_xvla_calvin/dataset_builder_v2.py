@@ -21,7 +21,7 @@ from typing import Any
 
 import numpy as np
 
-from train.dataset_builder import (
+from train.legacy_xvla_calvin.dataset_builder import (
     SUCCESS_PROGRESS_POINTS,
     RolloutDatasetBuilder,
     RolloutRecord,

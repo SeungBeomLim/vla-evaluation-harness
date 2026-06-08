@@ -36,13 +36,15 @@ if str(DEFAULT_XVLA_ROOT) not in sys.path:
 from models.modeling_xvla import XVLA  # type: ignore  # noqa: E402
 from models.processing_xvla import XVLAProcessor  # type: ignore  # noqa: E402
 
-from train.xvla_loss import (
+from train.legacy_xvla_calvin.xvla_loss import (
+    ActionEmbedder,
     TorchActionStats,
     compute_distance_probabilistic_nce_xvla_loss,
+    compute_embedding_probabilistic_nce_xvla_loss,
     compute_normalized_squared_hinge_triplet_xvla_loss,
     compute_preference_kl_loss,
 )
-from train.xvla_manifest_dataset import XVLAManifestCollator, XVLAManifestDataset
+from train.legacy_xvla_calvin.xvla_manifest_dataset import XVLAManifestCollator, XVLAManifestDataset
 
 
 def load_env_file(path: str | Path) -> bool:
@@ -131,19 +133,26 @@ def get_args_parser() -> argparse.ArgumentParser:
         choices=(
             "triplet_squared_hinge",
             "distance_probabilistic_nce",
+            "embedding_probabilistic_nce",
             "triplet_hinge",
             "probabilistic_nce",
+            "embedding_nce",
         ),
         default="triplet_squared_hinge",
         help=(
             "Contrastive loss objective. triplet_squared_hinge keeps the existing "
-            "squared-hinge triplet loss; distance_probabilistic_nce uses action-distance NCE. "
-            "triplet_hinge/probabilistic_nce are legacy aliases."
+            "squared-hinge triplet loss; distance_probabilistic_nce uses action-distance NCE; "
+            "embedding_probabilistic_nce uses learned action-embedding NCE. "
+            "triplet_hinge/probabilistic_nce/embedding_nce are legacy aliases."
         ),
     )
     parser.add_argument("--lambda_nce", type=float, default=1.0, help="Weight for probabilistic NCE loss.")
     parser.add_argument("--nce_tau", type=float, default=1.0, help="Temperature tau for probabilistic NCE/KL logits.")
     parser.add_argument("--lambda_gripper_nce", type=float, default=1.0, help="Gripper distance weight in NCE/KL distances.")
+    parser.add_argument("--action_embedder_dim", type=int, default=64, help="Embedding dim for embedding_probabilistic_nce.")
+    parser.add_argument("--action_embedder_hidden_dim", type=int, default=128, help="Hidden dim for embedding_probabilistic_nce projection head.")
+    parser.add_argument("--action_embedder_activation", choices=("gelu", "relu"), default="gelu")
+    parser.add_argument("--action_embedder_lr", type=float, default=1e-4, help="Learning rate for the embedding NCE action embedder.")
     parser.add_argument("--use_preference_kl", action="store_true", default=False, help="Add frozen base-model preference KL.")
     parser.add_argument("--lambda_kl", type=float, default=0.0, help="Weight for optional teacher preference KL.")
     # TODO: Evaluate hinge (non-squared) contrastive loss plus lambda_ctr warmup
@@ -174,7 +183,15 @@ def set_seed(seed: int) -> None:
     cudnn.benchmark = True
 
 
-def build_optimizer(model: XVLA, lr: float, weight_decay: float, betas: tuple[float, float], lr_coef_soft: float = 1.0) -> AdamW:
+def build_optimizer(
+    model: XVLA,
+    lr: float,
+    weight_decay: float,
+    betas: tuple[float, float],
+    lr_coef_soft: float = 1.0,
+    action_embedder: ActionEmbedder | None = None,
+    action_embedder_lr: float | None = None,
+) -> AdamW:
     vlm_params = list(model.vlm.parameters())
     soft_prompt_params = list(model.transformer.soft_prompt_hub.parameters())
     action_params = list(model.transformer.action_decoder.parameters()) + list(model.transformer.action_encoder.parameters())
@@ -187,6 +204,15 @@ def build_optimizer(model: XVLA, lr: float, weight_decay: float, betas: tuple[fl
         {"name": "soft_prompts", "params": soft_prompt_params, "lr": lr * lr_coef_soft, "weight_decay": weight_decay},
         {"name": "action_heads", "params": action_params, "lr": lr, "weight_decay": weight_decay},
     ]
+    if action_embedder is not None:
+        param_groups.append(
+            {
+                "name": "action_embedder",
+                "params": list(action_embedder.parameters()),
+                "lr": action_embedder_lr if action_embedder_lr is not None else lr,
+                "weight_decay": weight_decay,
+            }
+        )
     return AdamW(param_groups, betas=betas)
 
 
@@ -213,12 +239,14 @@ def update_group_lrs(optimizer: AdamW, step: int, args: argparse.Namespace) -> N
         "transformer_core": args.learning_rate,
         "soft_prompts": args.learning_rate * args.learning_coef,
         "action_heads": args.learning_rate,
+        "action_embedder": args.action_embedder_lr,
     }
     if step < args.freeze_steps:
         set_group_lr(optimizer, "vlm", 0.0)
         set_group_lr(optimizer, "transformer_core", 0.0)
         set_group_lr(optimizer, "soft_prompts", base["soft_prompts"])
         set_group_lr(optimizer, "action_heads", base["action_heads"])
+        set_group_lr(optimizer, "action_embedder", base["action_embedder"])
         return
     for name, base_lr in base.items():
         lr = linear_warmup_cosine(step, args.freeze_steps, args.warmup_steps, args.iters, base_lr, args.min_lr_ratio) if args.use_cosine_decay else base_lr
@@ -268,6 +296,7 @@ def compute_loss_for_batch(
     stats_torch: TorchActionStats,
     args: argparse.Namespace,
     *,
+    action_embedder: ActionEmbedder | None = None,
     teacher_model: XVLA | None = None,
 ) -> dict[str, torch.Tensor]:
     noise_context = make_action_noise_context(model, batch)
@@ -297,6 +326,21 @@ def compute_loss_for_batch(
             lambda_nce=args.lambda_nce,
             lambda_gripper_nce=args.lambda_gripper_nce,
         )
+    elif args.loss_type in {"embedding_probabilistic_nce", "embedding_nce"}:
+        if action_embedder is None:
+            raise ValueError("action_embedder is required for --loss_type embedding_probabilistic_nce")
+        loss_dict = compute_embedding_probabilistic_nce_xvla_loss(
+            pred_action_seq=pred_action_seq,
+            positive_action_first=batch["positive_action_first"],
+            negative_action_first=batch["negative_action_first"],
+            has_negative=batch["has_negative"],
+            sample_weight=batch.get("sample_weight"),
+            stats=stats_torch,
+            action_embedder=action_embedder,
+            tau=args.nce_tau,
+            lambda_pos=args.lambda_pos,
+            lambda_nce=args.lambda_nce,
+        )
     else:
         raise ValueError(f"Unknown loss_type: {args.loss_type}")
 
@@ -325,10 +369,21 @@ def compute_loss_for_batch(
     return loss_dict
 
 
-def save_checkpoint(accelerator: Accelerator, model: XVLA, output_dir: Path, global_step: int, stats_path: Path) -> None:
+def save_checkpoint(
+    accelerator: Accelerator,
+    model: XVLA,
+    output_dir: Path,
+    global_step: int,
+    stats_path: Path,
+    *,
+    action_embedder: ActionEmbedder | None = None,
+) -> None:
     save_dir = output_dir / f"ckpt-{global_step}"
     accelerator.print(f"Saving checkpoint to {save_dir}")
     accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
+    if action_embedder is not None and accelerator.is_main_process:
+        embedder = accelerator.unwrap_model(action_embedder)
+        torch.save(embedder.state_dict(), save_dir / "action_embedder.pt")
     (save_dir / "state.json").write_text(json.dumps({"global_step": global_step}, indent=2))
     if stats_path.exists():
         (save_dir / "action_stats.json").write_text(stats_path.read_text())
@@ -351,9 +406,12 @@ def evaluate(
     accelerator: Accelerator,
     stats_torch: TorchActionStats,
     args: argparse.Namespace,
+    action_embedder: ActionEmbedder | None = None,
     teacher_model: XVLA | None = None,
 ) -> dict[str, float]:
     model.eval()
+    if action_embedder is not None:
+        action_embedder.eval()
     if teacher_model is not None:
         teacher_model.eval()
     totals: dict[str, float] = {}
@@ -362,7 +420,14 @@ def evaluate(
     with torch.no_grad():
         for batch in eval_loader:
             batch = move_batch_to_device(batch, accelerator.device)
-            loss_dict = compute_loss_for_batch(model, batch, stats_torch, args, teacher_model=teacher_model)
+            loss_dict = compute_loss_for_batch(
+                model,
+                batch,
+                stats_torch,
+                args,
+                action_embedder=action_embedder,
+                teacher_model=teacher_model,
+            )
             batch_size = float(batch["positive_action_first"].shape[0])
             if metric_keys is None:
                 metric_keys = list(loss_dict.keys())
@@ -376,6 +441,8 @@ def evaluate(
                 totals[key] += float(stats_tensor[idx].item())
             total_samples += float(stats_tensor[-1].item())
     model.train()
+    if action_embedder is not None:
+        action_embedder.train()
     if teacher_model is not None:
         teacher_model.eval()
     denom = max(total_samples, 1.0)
@@ -422,6 +489,21 @@ def main(args: argparse.Namespace) -> None:
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+    action_embedder: ActionEmbedder | None = None
+    if args.loss_type in {"embedding_probabilistic_nce", "embedding_nce"}:
+        action_embedder = ActionEmbedder(
+            action_dim=10,
+            hidden_dim=args.action_embedder_hidden_dim,
+            embed_dim=args.action_embedder_dim,
+            activation=args.action_embedder_activation,
+        )
+        logger.info(
+            "ActionEmbedder enabled: action_dim=10 hidden_dim=%d embed_dim=%d activation=%s lr=%.2e",
+            args.action_embedder_hidden_dim,
+            args.action_embedder_dim,
+            args.action_embedder_activation,
+            args.action_embedder_lr,
+        )
     teacher_model: XVLA | None = None
     if args.use_preference_kl:
         logger.info("Loading frozen teacher model for preference KL from %s", args.models)
@@ -484,13 +566,26 @@ def main(args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
         betas=tuple(args.betas),
         lr_coef_soft=args.learning_coef,
+        action_embedder=action_embedder,
+        action_embedder_lr=args.action_embedder_lr,
     )
-    model, optimizer, train_loader, eval_loader = accelerator.prepare(model, optimizer, train_loader, eval_loader)
+    if action_embedder is not None:
+        model, action_embedder, optimizer, train_loader, eval_loader = accelerator.prepare(
+            model,
+            action_embedder,
+            optimizer,
+            train_loader,
+            eval_loader,
+        )
+    else:
+        model, optimizer, train_loader, eval_loader = accelerator.prepare(model, optimizer, train_loader, eval_loader)
     if teacher_model is not None:
         teacher_model.to(accelerator.device)
     stats_torch = TorchActionStats.from_python(action_stats, accelerator.device)
 
     model.train()
+    if action_embedder is not None:
+        action_embedder.train()
     global_step = 0
     log_start = time.time()
     summary: dict[str, Any] = {
@@ -523,13 +618,23 @@ def main(args: argparse.Namespace) -> None:
         batch = move_batch_to_device(batch, accelerator.device)
         update_group_lrs(optimizer, global_step, args)
 
-        loss_dict = compute_loss_for_batch(model, batch, stats_torch, args, teacher_model=teacher_model)
+        loss_dict = compute_loss_for_batch(
+            model,
+            batch,
+            stats_torch,
+            args,
+            action_embedder=action_embedder,
+            teacher_model=teacher_model,
+        )
         loss = loss_dict["loss_total"]
 
         accelerator.backward(loss)
         grad_norm = None
         if args.max_grad_norm:
-            grad_norm = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            clip_params = list(model.parameters())
+            if action_embedder is not None:
+                clip_params.extend(action_embedder.parameters())
+            grad_norm = accelerator.clip_grad_norm_(clip_params, args.max_grad_norm)
         optimizer.step()
         optimizer.zero_grad()
 
@@ -567,7 +672,15 @@ def main(args: argparse.Namespace) -> None:
                 )
 
         if global_step % args.eval_interval == 0:
-            eval_metrics = evaluate(model, eval_loader, accelerator, stats_torch, args, teacher_model=teacher_model)
+            eval_metrics = evaluate(
+                model,
+                eval_loader,
+                accelerator,
+                stats_torch,
+                args,
+                action_embedder=action_embedder,
+                teacher_model=teacher_model,
+            )
             accelerator.log({f"eval/{key}": value for key, value in eval_metrics.items()}, step=global_step)
             summary["last_eval_step"] = global_step
             for key, value in eval_metrics.items():
@@ -585,7 +698,7 @@ def main(args: argparse.Namespace) -> None:
         global_step += 1
         progress.update(1)
         if accelerator.is_main_process and (global_step == args.iters or global_step % args.save_interval == 0):
-            save_checkpoint(accelerator, model, output_dir, global_step, stats_path)
+            save_checkpoint(accelerator, model, output_dir, global_step, stats_path, action_embedder=action_embedder)
 
     progress.close()
     summary["final_global_step"] = global_step

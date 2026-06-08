@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -26,10 +27,71 @@ class TorchActionStats:
         )
 
 
+class ActionEmbedder(nn.Module):
+    """Projection head for embedding-based action preference learning."""
+
+    def __init__(
+        self,
+        action_dim: int = 10,
+        hidden_dim: int = 128,
+        embed_dim: int = 64,
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+        act: type[nn.Module]
+        if activation == "relu":
+            act = nn.ReLU
+        elif activation == "gelu":
+            act = nn.GELU
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+        self.net = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            act(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            act(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+    def forward(self, action: torch.Tensor, *, return_pre_norm: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        z = self.net(action)
+        z_norm = F.normalize(z, dim=-1, eps=1e-8)
+        if return_pre_norm:
+            return z_norm, z
+        return z_norm
+
+
 def _normalize_components(action_10d: torch.Tensor, stats: TorchActionStats) -> tuple[torch.Tensor, torch.Tensor]:
     pos = (action_10d[..., 0:3] - stats.pos_mean) / stats.pos_std
     rot = (action_10d[..., 3:9] - stats.rot_mean) / stats.rot_std
     return pos, rot
+
+
+def _bc_components(
+    pred_action_first: torch.Tensor,
+    positive_action_first: torch.Tensor,
+    stats: TorchActionStats,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    pred_pos_n, pred_rot_n = _normalize_components(pred_action_first, stats)
+    pos_pos_n, pos_rot_n = _normalize_components(positive_action_first, stats)
+
+    pos_loss = F.mse_loss(pred_pos_n, pos_pos_n, reduction="none").mean(dim=-1)
+    rot_loss = F.mse_loss(pred_rot_n, pos_rot_n, reduction="none").mean(dim=-1)
+    grip_loss = F.binary_cross_entropy_with_logits(
+        pred_action_first[..., 9],
+        positive_action_first[..., 9],
+        reduction="none",
+    )
+    return pos_loss + rot_loss + grip_loss, pos_loss, rot_loss, grip_loss
+
+
+def _embedding_action_input(action_10d: torch.Tensor, stats: TorchActionStats, *, gripper_is_logit: bool) -> torch.Tensor:
+    pos_n, rot_n = _normalize_components(action_10d, stats)
+    gripper = torch.sigmoid(action_10d[..., 9]) if gripper_is_logit else action_10d[..., 9]
+    return torch.cat([pos_n, rot_n, gripper.unsqueeze(-1)], dim=-1)
 
 
 def _preference_squared_distances(
@@ -226,6 +288,80 @@ def compute_distance_probabilistic_nce_xvla_loss(
         "nce_d_neg": d_neg_mean,
         "nce_logit": logit_mean,
         "nce_prob_pos": prob_mean,
+        "triplet_fraction": has_negative.float().mean(),
+        "triplet_weight_mean": ctr_weight[has_negative].mean()
+        if has_negative.any()
+        else ctr_weight.new_tensor(0.0),
+    }
+
+
+def compute_embedding_probabilistic_nce_xvla_loss(
+    pred_action_seq: torch.Tensor,
+    positive_action_first: torch.Tensor,
+    negative_action_first: torch.Tensor,
+    has_negative: torch.Tensor,
+    stats: TorchActionStats,
+    action_embedder: ActionEmbedder,
+    *,
+    sample_weight: torch.Tensor | None = None,
+    tau: float = 0.1,
+    lambda_pos: float = 1.0,
+    lambda_nce: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    """Compute BC + embedding-based probabilistic two-way NCE preference loss."""
+    pred = pred_action_seq[:, 0, :10]
+    l_bc, pos_loss, rot_loss, grip_loss = _bc_components(pred, positive_action_first, stats)
+    loss_bc = l_bc.mean()
+
+    pred_embed_input = _embedding_action_input(pred, stats, gripper_is_logit=True)
+    pos_embed_input = _embedding_action_input(positive_action_first, stats, gripper_is_logit=False)
+    neg_embed_input = _embedding_action_input(negative_action_first, stats, gripper_is_logit=False)
+
+    z_pred, z_pred_raw = action_embedder(pred_embed_input, return_pre_norm=True)
+    z_pos, z_pos_raw = action_embedder(pos_embed_input.detach(), return_pre_norm=True)
+    z_neg, z_neg_raw = action_embedder(neg_embed_input.detach(), return_pre_norm=True)
+
+    tau_tensor = pred.new_tensor(max(float(tau), 1e-8))
+    sim_pos = (z_pred * z_pos).sum(dim=-1)
+    sim_neg = (z_pred * z_neg).sum(dim=-1)
+    logits_gap = (sim_pos - sim_neg) / tau_tensor
+    l_nce_all = F.softplus(-logits_gap)
+    loss_nce = _masked_weighted_mean(l_nce_all, has_negative, sample_weight)
+    loss_total = lambda_pos * loss_bc + lambda_nce * loss_nce
+
+    active = has_negative
+    active_count = active.float().sum().clamp_min(1.0).to(dtype=pred.dtype)
+
+    def active_mean(values: torch.Tensor) -> torch.Tensor:
+        return torch.where(active, values, torch.zeros_like(values)).sum() / active_count
+
+    ctr_weight = (
+        torch.ones_like(l_bc)
+        if sample_weight is None
+        else sample_weight.to(device=l_bc.device, dtype=l_bc.dtype)
+    )
+    pred_raw_norm = torch.linalg.norm(z_pred_raw, dim=-1)
+    pos_raw_norm = torch.linalg.norm(z_pos_raw, dim=-1)
+    neg_raw_norm = torch.linalg.norm(z_neg_raw, dim=-1)
+
+    return {
+        "loss_total": loss_total,
+        "loss_pos": loss_bc,
+        "loss_ctr": loss_nce,
+        "loss_bc": loss_bc,
+        "loss_nce": loss_nce,
+        "loss_pos_position": pos_loss.mean(),
+        "loss_pos_rotation": rot_loss.mean(),
+        "loss_pos_gripper": grip_loss.mean(),
+        "emb_sim_pos": active_mean(sim_pos),
+        "emb_sim_neg": active_mean(sim_neg),
+        "emb_sim_gap": active_mean(sim_pos - sim_neg),
+        "emb_logit_gap": active_mean(logits_gap),
+        "emb_prob_pos": active_mean(torch.sigmoid(logits_gap)),
+        "emb_raw_norm_pred": pred_raw_norm.mean(),
+        "emb_raw_norm_pos": pos_raw_norm.mean(),
+        "emb_raw_norm_neg": neg_raw_norm.mean(),
+        "emb_raw_norm_std": torch.cat([pred_raw_norm, pos_raw_norm, neg_raw_norm], dim=0).std(unbiased=False),
         "triplet_fraction": has_negative.float().mean(),
         "triplet_weight_mean": ctr_weight[has_negative].mean()
         if has_negative.any()

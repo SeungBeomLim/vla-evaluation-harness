@@ -1,0 +1,70 @@
+# GR00T N1.6 LIBERO rollout collection.
+# Saves per-step trajectory artifacts, including action provenance metadata.
+server:
+  url: "ws://localhost:8000"
+
+docker:
+  image: ghcr.io/allenai/vla-evaluation-harness/libero:latest
+
+output_dir: "./results/groot_libero_base_260505"
+
+benchmarks:
+  - benchmark: "vla_eval.benchmarks.libero.benchmark:LIBEROBenchmark"
+    subname: libero_spatial
+    mode: sync
+    episodes_per_task: 50
+    save_rollout_video: false
+    save_rollout_trajectory: true
+    rollout_video_fps: 10
+    params:
+      suite: libero_spatial
+      seed: 7
+      num_steps_wait: 10
+      send_state: true
+      send_wrist_image: true
+      quat_no_antipodal: true
+
+  - benchmark: "vla_eval.benchmarks.libero.benchmark:LIBEROBenchmark"
+    subname: libero_object
+    mode: sync
+    episodes_per_task: 50
+    save_rollout_video: false
+    save_rollout_trajectory: true
+    rollout_video_fps: 10
+    params:
+      suite: libero_object
+      seed: 7
+      num_steps_wait: 10
+      send_state: true
+      send_wrist_image: true
+      quat_no_antipodal: true
+
+  - benchmark: "vla_eval.benchmarks.libero.benchmark:LIBEROBenchmark"
+    subname: libero_goal
+    mode: sync
+    episodes_per_task: 50
+    save_rollout_video: false
+    save_rollout_trajectory: true
+    rollout_video_fps: 10
+    params:
+      suite: libero_goal
+      seed: 7
+      num_steps_wait: 10
+      send_state: true
+      send_wrist_image: true
+      quat_no_antipodal: true
+
+  - benchmark: "vla_eval.benchmarks.libero.benchmark:LIBEROBenchmark"
+    subname: libero_10
+    mode: sync
+    episodes_per_task: 50
+    save_rollout_video: false
+    save_rollout_trajectory: true
+    rollout_video_fps: 10
+    params:
+      suite: libero_10
+      seed: 7
+      num_steps_wait: 10
+      send_state: true
+      send_wrist_image: true
+      quat_no_antipodal: true

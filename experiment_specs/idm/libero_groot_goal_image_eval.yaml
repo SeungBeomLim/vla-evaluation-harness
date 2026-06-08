@@ -1,0 +1,34 @@
+# Goal-image IDM evaluation config for offline metrics and optional LIBERO one-step replay.
+
+paths:
+  checkpoint: train/idm/runs/idm_groot-n16_libero_h1_260526_1430/best.pt
+  output_dir: train/idm/runs/idm_groot-n16_libero_h1_260526_1430/eval_h1
+  rollout_roots:
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed7_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed13_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed17_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed23_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed29_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed31_260506
+
+data:
+  preset: libero:groot
+  trajectory_glob: rollouts/*/trajectory.npz
+  image_keys:
+    - image_agentview
+    - image_wrist
+  state_key: state
+  action_key: env_action
+
+eval:
+  num_samples: 256
+  max_trajectories: 1000
+  seed: 0
+
+replay:
+  enabled: true
+  num_samples: 20
+
+runtime:
+  device: cuda
+  cache_size: 2

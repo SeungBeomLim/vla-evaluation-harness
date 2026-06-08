@@ -48,6 +48,9 @@ class OpenVLAModelServer(PredictModelServer):
         *,
         jpeg_roundtrip: bool = False,
         center_crop: bool = False,
+        use_cache: bool = False,
+        oom_retry: bool = True,
+        empty_cache_before_predict: bool = True,
         chunk_size: int = 1,
         action_ensemble: str = "newest",
         **kwargs: Any,
@@ -57,7 +60,25 @@ class OpenVLAModelServer(PredictModelServer):
         self.unnorm_key = unnorm_key
         self.jpeg_roundtrip = jpeg_roundtrip
         self.center_crop = center_crop
+        self.use_cache = use_cache
+        self.oom_retry = oom_retry
+        self.empty_cache_before_predict = empty_cache_before_predict
+        self._model = None
+        self._processor = None
+        self._device = None
 
+    def get_observation_params(self) -> dict[str, Any]:
+        return {"seed": 0}
+
+    def get_action_spec(self) -> dict[str, DimSpec]:
+        return {"position": POSITION_DELTA, "rotation": ROTATION_AA, "gripper": GRIPPER_CLOSE_POS}
+
+    def get_observation_spec(self) -> dict[str, DimSpec]:
+        return {"image": IMAGE_RGB, "language": LANGUAGE}
+
+    def _load_model(self) -> None:
+        if self._model is not None:
+            return
         import torch
         from transformers import AutoModelForVision2Seq, AutoProcessor
 
@@ -70,16 +91,8 @@ class OpenVLAModelServer(PredictModelServer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         ).to(self._device)
+        self._model.eval()
         logger.info("OpenVLA model loaded.")
-
-    def get_observation_params(self) -> dict[str, Any]:
-        return {"seed": 0}
-
-    def get_action_spec(self) -> dict[str, DimSpec]:
-        return {"position": POSITION_DELTA, "rotation": ROTATION_AA, "gripper": GRIPPER_CLOSE_POS}
-
-    def get_observation_spec(self) -> dict[str, DimSpec]:
-        return {"image": IMAGE_RGB, "language": LANGUAGE}
 
     def _preprocess_image(self, obs: Observation) -> Any:
         """Convert observation image to PIL with optional RLDS-matching preprocessing."""
@@ -115,8 +128,40 @@ class OpenVLAModelServer(PredictModelServer):
 
         return pil
 
+    def _cuda_memory_summary(self) -> str:
+        try:
+            import torch
+
+            if self._device is None or self._device.type != "cuda":
+                return "cuda=unavailable"
+            free, total = torch.cuda.mem_get_info(self._device)
+            allocated = torch.cuda.memory_allocated(self._device)
+            reserved = torch.cuda.memory_reserved(self._device)
+            mib = 1024 * 1024
+            return (
+                f"cuda free={free / mib:.0f}MiB total={total / mib:.0f}MiB "
+                f"allocated={allocated / mib:.0f}MiB reserved={reserved / mib:.0f}MiB"
+            )
+        except Exception as exc:
+            return f"cuda_memory_unavailable: {exc}"
+
+    def _predict_action_once(self, inputs: Any, kwargs: dict[str, Any]) -> Any:
+        import torch
+
+        assert self._model is not None
+        with torch.inference_mode():
+            return self._model.predict_action(**inputs, **kwargs)
+
+    def _is_cuda_oom(self, exc: BaseException) -> bool:
+        text = str(exc).lower()
+        return "cuda" in text and ("out of memory" in text or "memoryallocation" in text)
+
     def predict(self, obs: Observation, ctx: SessionContext) -> Action:
         import torch
+
+        self._load_model()
+        assert self._model is not None
+        assert self._processor is not None
 
         pil_image = self._preprocess_image(obs)
         task_description = obs.get("task_description", "")
@@ -124,11 +169,28 @@ class OpenVLAModelServer(PredictModelServer):
 
         inputs = self._processor(prompt, pil_image).to(self._device, dtype=torch.bfloat16)
 
-        kwargs: dict[str, Any] = {"do_sample": False}
+        kwargs: dict[str, Any] = {"do_sample": False, "use_cache": self.use_cache}
         if self.unnorm_key:
             kwargs["unnorm_key"] = self.unnorm_key
 
-        action = self._model.predict_action(**inputs, **kwargs)
+        if self.empty_cache_before_predict and self._device is not None and self._device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        try:
+            action = self._predict_action_once(inputs, kwargs)
+        except Exception as exc:
+            if (
+                not self.oom_retry
+                or self._device is None
+                or self._device.type != "cuda"
+                or not self._is_cuda_oom(exc)
+            ):
+                raise
+            logger.warning("OpenVLA CUDA OOM before retry: %s", self._cuda_memory_summary())
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(self._device)
+            logger.warning("Retrying OpenVLA inference after empty_cache: %s", self._cuda_memory_summary())
+            action = self._predict_action_once(inputs, kwargs)
         # Gripper: RLDS [0=close,1=open] → robosuite [-1=open,+1=close]
         action_arr = np.asarray(action, dtype=np.float32)
         action_arr[..., -1] = -np.sign(2 * action_arr[..., -1] - 1)

@@ -153,6 +153,8 @@ class PredictModelServer(ModelServer):
 
         self._chunk_buffers: dict[str, ActionChunkBuffer] = {}
         self._native_action_buffers: dict[str, deque[np.ndarray]] = {}
+        self._action_metadata_buffers: dict[str, deque[dict[str, Any]]] = {}
+        self._session_chunk_counters: dict[str, int] = {}
         self._session_chunk_sizes: dict[str, int] = {}
         # Serialise predict() calls so only one runs on the GPU at a time.
         # The batched path (_dispatch_loop) is already single-threaded; this
@@ -211,6 +213,58 @@ class PredictModelServer(ModelServer):
         """Return the effective chunk_size for a session."""
         return self._session_chunk_sizes.get(ctx.session_id, self.chunk_size)
 
+    def _next_chunk_id(self, session_id: str) -> int:
+        chunk_id = self._session_chunk_counters.get(session_id, 0)
+        self._session_chunk_counters[session_id] = chunk_id + 1
+        return chunk_id
+
+    def _action_ensemble_name(self) -> str:
+        if isinstance(self.action_ensemble, str):
+            return self.action_ensemble
+        return getattr(self.action_ensemble, "__name__", type(self.action_ensemble).__name__)
+
+    def _make_action_metadata(
+        self,
+        ctx: SessionContext,
+        *,
+        chunk_id: int,
+        chunk_start_step: int,
+        chunk_offset: int,
+        chunk_size: int,
+        from_buffer: bool,
+    ) -> dict[str, Any]:
+        """Describe the model inference/chunk that produced an action."""
+        return {
+            "chunk_id": int(chunk_id),
+            "chunk_start_step": int(chunk_start_step),
+            "model_inference_step": int(chunk_start_step),
+            "chunk_offset": int(chunk_offset),
+            "chunk_size": int(chunk_size),
+            "is_chunk_start": bool(chunk_offset == 0),
+            "from_buffer": bool(from_buffer),
+            "model_output_index": int(chunk_offset),
+            "model_server": type(self).__name__,
+            "action_ensemble": self._action_ensemble_name(),
+            "continuous_inference": bool(self.continuous_inference),
+            "laas": bool(self.laas),
+            "session_step": int(ctx.step),
+        }
+
+    def _attach_action_metadata(
+        self,
+        payload: Action,
+        metadata: dict[str, Any],
+        *,
+        model_action_chunk: np.ndarray | None = None,
+        model_native_action_chunk: np.ndarray | None = None,
+    ) -> Action:
+        payload = {**payload, "action_metadata": metadata}
+        if model_action_chunk is not None:
+            payload["model_action_chunk"] = model_action_chunk
+        if model_native_action_chunk is not None:
+            payload["model_native_action_chunk"] = model_native_action_chunk
+        return payload
+
     def _try_serve_from_buffer(self, ctx: SessionContext) -> Action | None:
         """Return a buffered action payload if available, else ``None``."""
         cs = self._get_chunk_size(ctx)
@@ -229,6 +283,20 @@ class PredictModelServer(ModelServer):
             native_buf = self._native_action_buffers.get(sid)
             if native_buf:
                 payload["model_native_action"] = native_buf.popleft()
+            meta_buf = self._action_metadata_buffers.get(sid)
+            if meta_buf:
+                metadata = meta_buf.popleft()
+                metadata = {**metadata, "from_buffer": True, "session_step": int(ctx.step)}
+            else:
+                metadata = self._make_action_metadata(
+                    ctx,
+                    chunk_id=-1,
+                    chunk_start_step=ctx.step,
+                    chunk_offset=0,
+                    chunk_size=1,
+                    from_buffer=True,
+                )
+            payload = self._attach_action_metadata(payload, metadata)
             return payload
         return None
 
@@ -255,14 +323,38 @@ class PredictModelServer(ModelServer):
 
         cs = self._get_chunk_size(ctx)
         if cs is None or actions.ndim == 1:
-            await ctx.send_action(result)
+            metadata = self._make_action_metadata(
+                ctx,
+                chunk_id=self._next_chunk_id(ctx.session_id),
+                chunk_start_step=ctx.step,
+                chunk_offset=0,
+                chunk_size=1,
+                from_buffer=False,
+            )
+            await ctx.send_action(self._attach_action_metadata(result, metadata))
             return
 
         native_actions = result.get("model_native_actions")
+        native_chunk: np.ndarray | None = None
         if native_actions is not None:
             native_arr = np.asarray(native_actions, dtype=np.float32)
             if native_arr.ndim == 2:
-                self._native_action_buffers[ctx.session_id] = deque(native_arr[: len(actions)])
+                native_chunk = native_arr[: len(actions)]
+                self._native_action_buffers[ctx.session_id] = deque(native_chunk)
+
+        chunk_id = self._next_chunk_id(ctx.session_id)
+        metadata = [
+            self._make_action_metadata(
+                ctx,
+                chunk_id=chunk_id,
+                chunk_start_step=ctx.step,
+                chunk_offset=i,
+                chunk_size=len(actions),
+                from_buffer=i > 0,
+            )
+            for i in range(len(actions))
+        ]
+        self._action_metadata_buffers[ctx.session_id] = deque(metadata)
 
         # Push chunk and pop first action
         buf = self._chunk_buffers[ctx.session_id]
@@ -273,6 +365,14 @@ class PredictModelServer(ModelServer):
             native_buf = self._native_action_buffers.get(ctx.session_id)
             if native_buf:
                 payload["model_native_action"] = native_buf.popleft()
+            meta_buf = self._action_metadata_buffers.get(ctx.session_id)
+            action_metadata = meta_buf.popleft() if meta_buf else metadata[0]
+            payload = self._attach_action_metadata(
+                payload,
+                action_metadata,
+                model_action_chunk=actions,
+                model_native_action_chunk=native_chunk,
+            )
             await ctx.send_action(payload)
 
     # ------------------------------------------------------------------
@@ -476,8 +576,17 @@ class PredictModelServer(ModelServer):
                     await ctx.send_action(result)
                     continue
 
-                action = self._pick_action(actions, obs_time)
-                await ctx.send_action({"actions": action})
+                action_idx = self._pick_action_index(actions, obs_time)
+                action = actions if actions.ndim == 1 else actions[action_idx]
+                metadata = self._make_action_metadata(
+                    ctx,
+                    chunk_id=self._next_chunk_id(ctx.session_id),
+                    chunk_start_step=ctx.step,
+                    chunk_offset=action_idx,
+                    chunk_size=len(actions) if getattr(actions, "ndim", 1) == 2 else 1,
+                    from_buffer=False,
+                )
+                await ctx.send_action(self._attach_action_metadata({"actions": action}, metadata))
             except Exception:
                 logger.exception("CI send_action error session=%s", session_id)
                 break
@@ -489,6 +598,12 @@ class PredictModelServer(ModelServer):
         """
         if actions.ndim == 1:
             return actions
+        return actions[self._pick_action_index(actions, obs_time)]
+
+    def _pick_action_index(self, actions: np.ndarray, obs_time: float) -> int:
+        """Return the index selected from a chunk, applying LAAS if enabled."""
+        if actions.ndim == 1:
+            return 0
 
         if self.laas and self.hz > 0:
             delay = time.monotonic() - obs_time
@@ -503,10 +618,10 @@ class PredictModelServer(ModelServer):
                     delay * 1000,
                     self.hz,
                 )
-            return actions[idx]
+            return idx
 
         # CI without LAAS: use first action in chunk
-        return actions[0]
+        return 0
 
     # ------------------------------------------------------------------
     # Episode lifecycle
@@ -523,6 +638,8 @@ class PredictModelServer(ModelServer):
         sid = ctx.session_id
         self._chunk_buffers.pop(sid, None)
         self._native_action_buffers.pop(sid, None)
+        self._action_metadata_buffers.pop(sid, None)
+        self._session_chunk_counters[sid] = 0
 
         if self.continuous_inference:
             await self._stop_ci(sid)
@@ -535,6 +652,9 @@ class PredictModelServer(ModelServer):
         """Clean up chunk buffer and stop CI loop."""
         sid = ctx.session_id
         self._chunk_buffers.pop(sid, None)
+        self._native_action_buffers.pop(sid, None)
+        self._action_metadata_buffers.pop(sid, None)
+        self._session_chunk_counters.pop(sid, None)
         self._session_chunk_sizes.pop(sid, None)
 
         if self.continuous_inference:

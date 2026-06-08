@@ -1,0 +1,58 @@
+# Goal-image IDM training config for LIBERO + GR00T rollouts, horizon=5.
+
+paths:
+  rollout_roots:
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed7_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed13_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed17_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed23_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed29_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed31_260506
+  output_dir: train/idm/runs/idm_groot-n16_libero_h5_260601_1816
+
+data:
+  preset: libero:groot
+  trajectory_glob: rollouts/*/trajectory.npz
+  image_keys:
+    - image_agentview
+    - image_wrist
+  state_key: state
+  action_key: env_action
+  chunk_start_only: false
+  max_samples: null
+  max_trajectories: null
+  shuffle_trajectories: true
+  index_cache_path: train/idm/runs/idm_groot-n16_libero_h5_260601_1816/index_cache.npz
+  rebuild_index_cache: false
+
+model:
+  image_size: 128
+  horizon: 5
+  include_state: false
+  image_feature_dim: 128
+  hidden_dim: 512
+  num_layers: 3
+  dropout: 0.0
+  action_limit: 1.0
+
+training:
+  batch_size: 128
+  epochs: 20
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  val_ratio: 0.05
+  seed: 0
+  shuffle_batches: false
+
+runtime:
+  device: cuda
+  num_workers: 4
+  cache_size: 2
+  persistent_workers: true
+  dotenv: .env
+
+wandb:
+  project: idm-image-libero_gr00tn1.6
+  run_name: idm_groot-n16_libero_h5_260601_1816
+  entity: null
+  mode: online

@@ -1,0 +1,35 @@
+# Goal-image IDM evaluation config for the horizon=5 LIBERO + GR00T IDM.
+
+paths:
+  checkpoint: train/idm/runs/idm_groot-n16_libero_h5_260601_1816/best.pt
+  output_dir: train/idm/runs/idm_groot-n16_libero_h5_260601_1816/eval_h5_replay200
+  rollout_roots:
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed7_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed13_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed17_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed23_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed29_260506
+    - /data/vla-evaluation/benchmark/groot_libero_base_seed31_260506
+
+data:
+  preset: libero:groot
+  trajectory_glob: rollouts/*/trajectory.npz
+  image_keys:
+    - image_agentview
+    - image_wrist
+  state_key: state
+  action_key: env_action
+
+eval:
+  num_samples: 1000
+  max_trajectories: 1000
+  shuffle_trajectories: true
+  seed: 1
+
+replay:
+  enabled: true
+  num_samples: 200
+
+runtime:
+  device: cuda
+  cache_size: 2
